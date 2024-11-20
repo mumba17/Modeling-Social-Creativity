@@ -2,12 +2,18 @@ import mesa
 import numpy as np
 from knn import kNN
 from features import FeatureExtractor
+import torchvision.transforms as transforms
 import genart as genart
 import random
 import torch
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import datetime
+import os
+import io
+import networkx as nx
+import matplotlib.pyplot as plt
+from PIL import Image
 
 log_dir = f"logs/run_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_v1"
 
@@ -17,25 +23,24 @@ class Agent(mesa.Agent):
         self.unique_id = unique_id
         self.k = 10
         self.knn = kNN(k=self.k, agent_id=unique_id)
-        self.preferred_novelty = np.random.normal(0.5, 0.1)
         
-        # Parameters for reward/punishment sigmoids
-        self.reward_threshold = self.preferred_novelty - 0.2  # n1 in the paper
-        self.punish_threshold = self.preferred_novelty + 0.2  # n2 in the paper
+        # Normally distributed novelty preference
+        self.preferred_novelty = np.random.normal(0.5, 0.155)
+        
+        # Wundt curve parameters
+        self.reward_threshold = self.preferred_novelty - 0.2
+        self.punish_threshold = self.preferred_novelty + 0.2
         self.sigmoid_steepness = 10.0
-        self.punishment_weight = 1.2  # Alpha in the paper
+        self.punishment_weight = 1.2
         
+        # Generation parameters
         self.gen_depth = np.random.randint(4, 8)
         self.current_expression = None
-        self.artifact_memory = [] # Store previous successful expressions
+        self.artifact_memory = []
         
-        # Connection parameters
-        self.decay_rate = 0.95  # Rate at which connections decay
-        self.min_connection = 0.1  # Threshold below which connections break
-        self.max_connection = 1.0  # Maximum connection strength
-        self.reinforcement_rate = 0.4  # How quickly connections strengthen/weaken
-        self.exploration_prob = 0.2  # Probability to form new random connection
-        
+        # Communication
+        self.inbox = []
+            
     def sigmoid(self, x, threshold):
         """Helper function to compute sigmoid curve"""
         return 1 / (1 + np.exp(-self.sigmoid_steepness * (x - threshold)))
@@ -103,6 +108,9 @@ class Agent(mesa.Agent):
                 print(f"Warning: Invalid features generated for agent {self.unique_id}")
                 features = torch.zeros_like(features)
                 
+            self.generated_image = image
+            self.generated_expression = self.current_expression.to_string()
+                
             return {
                 'image': image,
                 'features': features,
@@ -117,133 +125,143 @@ class Agent(mesa.Agent):
                 'features': torch.zeros((1, 64), device=self.model.feature_extractor.device),
                 'expression': self.current_expression
             }
+        
+    def log_metrics(self, artifact_data=None):
+        """Enhanced logging with dedicated agent cards and image saving"""
+        step = self.model.schedule.time
+        writer = self.model.agent_writers[self.unique_id]
+        
+        # Agent parameters
+        writer.add_scalar('parameters/preferred_novelty', self.preferred_novelty, step)
+        writer.add_scalar('parameters/reward_threshold', self.reward_threshold, step)
+        writer.add_scalar('parameters/punish_threshold', self.punish_threshold, step)
+        
+        # Memory metrics
+        writer.add_scalar('memory/size', len(self.artifact_memory), step)
+        writer.add_scalar('memory/inbox_size', len(self.inbox), step)
+        
+        if artifact_data:
+            # Log generated artifact
+            image = artifact_data['image']
+            expression = artifact_data['expression'].to_string()
+            
+            # Save image
+            if image:
+                # Convert PIL image to tensor
+                image_tensor = transforms.ToTensor()(image)
+                writer.add_image('generated/current_image', image_tensor, step)
+            
+            # Log expression
+            writer.add_text('generated/expression', expression, step)
+            
+            # Log novelty/interest metrics
+            distances = self.knn.aggregate_distances(method='mean')
+            if distances:
+                avg_distance = np.mean(list(distances.values()))
+                writer.add_scalar('evaluation/avg_distance', avg_distance, step)
+                
+            if 'novelty' in artifact_data:
+                writer.add_scalar('evaluation/novelty', artifact_data['novelty'], step)
+            if 'interest' in artifact_data:
+                writer.add_scalar('evaluation/interest', artifact_data['interest'], step)
+        
+        # Communication metrics
+        in_edges = self.model.communication_graph.in_degree(self.unique_id)
+        out_edges = self.model.communication_graph.out_degree(self.unique_id)
+        writer.add_scalar('communication/in_degree', in_edges, step)
+        writer.add_scalar('communication/out_degree', out_edges, step)
+        
+        # Add custom figure showing agent's state
+        fig = plt.figure(figsize=(10, 6))
+        plt.subplot(121)
+        plt.title(f"Agent {self.unique_id} Wundt Curve")
+        x = np.linspace(0, 1, 100)
+        y = [self.hedonic_evaluation(xi) for xi in x]
+        plt.plot(x, y)
+        plt.grid(True)
+        
+        # Convert figure to tensor
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png')
+        buf.seek(0)
+        img = Image.open(buf)
+        writer.add_image('state/wundt_curve', transforms.ToTensor()(img), step)
+        plt.close(fig)
 
-    def get_connected_agents(self):
-        """Get list of agents this agent is connected to (non-zero weights)"""
-        connections = self.model.connections[self.unique_id]
-        return np.where(abs(connections) > self.min_connection)[0]
-    
-    def form_new_connection(self):
-        """Form new random connection with unconnected agent"""
-        # Get currently unconnected agents
-        connections = self.model.connections[self.unique_id]
-        unconnected = np.where(abs(connections) <= self.min_connection)[0]
-        unconnected = unconnected[unconnected != self.unique_id]  # Remove self
+    def step(self):
+        """One step of agent behavior encompassing:
+        - Artifact generation and self-evaluation 
+        - Sharing if sufficiently novel
+        - Processing received artifacts"""
+
+        # Generate and evaluate artifact
+        artifact = self.generate_artifact()
         
-        if len(unconnected) > 0:
-            # Choose random unconnected agent
-            new_connection = np.random.choice(unconnected)
-            # Initialize with small random weight
-            self.model.connections[self.unique_id, new_connection] = np.random.uniform(-0.3, 0.3)
-    
-    def update_connection(self, other_agent_id, interest_value):
-        """Update connection weight based on interest in received artifact"""
-        current_weight = self.model.connections[self.unique_id, other_agent_id]
-        
-        # Update weight based on interest
-        delta = self.reinforcement_rate * interest_value
-        new_weight = current_weight + delta
-        
-        # Clip to valid range
-        new_weight = np.clip(new_weight, -self.max_connection, self.max_connection)
-        
-        # Update connection weight
-        self.model.connections[self.unique_id, other_agent_id] = new_weight
-        
-    def evaluate_artifact(self, artifact):
-        """Evaluate artifact novelty and calculate interest"""
-        try:
-            features = artifact['features']
+        # Calculate self-evaluated novelty and interest
+        if artifact['features'] is not None:
+            # Add to personal experience/memory
+            self.knn.add_feature_vectors(artifact['features'])
             
-            # Add features to kNN memory
-            self.knn.add_feature_vectors(features)
-            
-            # Get novelty score from kNN distances
+            # Get novelty distance using kNN
             distances = self.knn.aggregate_distances(method='mean')
             novelty = np.mean(list(distances.values())) if distances else 0.0
             
-            # Calculate interest using hedonic function
+            # Calculate interest using Wundt curve (hedonic function)
             interest = self.hedonic_evaluation(novelty)
             
-            # Only remove features if exceeding capacity
-            if self.knn.feature_vectors.shape[0] > 100:  # Set reasonable capacity
-                self.knn.remove_feature_vectors([0])  # Remove oldest
+            artifact['novelty'] = novelty
+            artifact['interest'] = interest
+            
+            # If interesting enough, share with random other agent
+            if interest > self.model.communication_threshold:
+                # Package artifact with metadata
+                message = {
+                    'artifact': artifact,
+                    'sender_id': self.unique_id,
+                    'novelty': novelty,
+                    'interest': interest,
+                    'timestamp': self.model.schedule.time
+                }
                 
-            return interest
-                
-        except Exception as e:
-            print(f"Error evaluating artifact: {e}")
-            return 0.0
-        
+                # Select random recipient that isn't self
+                other_agents = [a for a in self.model.schedule.agents 
+                            if a.unique_id != self.unique_id]
+                if other_agents:
+                    recipient = self.random.choice(other_agents)
+                    recipient.inbox.append(message)
+                    
+                    # Log communication for analysis
+                    self.model.log_communication(self.unique_id, recipient.unique_id)
 
-    def step(self):
-        # Generate and evaluate own artifact 
-        self_artifact = self.generate_artifact()
-        interest = self.evaluate_artifact(self_artifact)
-        
-        # Store successful artifacts with complete info
-        if interest > 0.3:  # High personal interest threshold
-            if len(self.artifact_memory) >= 10:
-                self.artifact_memory.pop(0)
-            self.artifact_memory.append({
-                'expression': self_artifact['expression'],
-                'features': self_artifact['features'], 
-                'interest': interest,  # Store the interest value
-                'timestamp': self.model.schedule.time
-            })
-        
-        # Submit to domain if interesting enough
-        if interest > self.model.domain_threshold:  # Lower domain threshold
-            self.model.add_to_domain(self_artifact)
-        
-        # Decay existing connections
-        connections = self.model.connections[self.unique_id]
-        connections *= self.decay_rate
-        
-        # Remove weak connections
-        connections[abs(connections) < self.min_connection] = 0
-        
-        # Possibly form new random connection
-        if random.random() < self.exploration_prob:
-            self.form_new_connection()
-        
-        # Get currently connected agents
-        connected_agents = self.get_connected_agents()
-        
-        if len(connected_agents) > 0:
-            # Select agent to request from based on connection weights
-            weights = self.model.connections[self.unique_id, connected_agents]
-            probs = abs(weights) / abs(weights).sum()
-            selected_agent = np.random.choice(connected_agents, p=probs)
+        # Process inbox
+        for message in self.inbox:
+            received_artifact = message['artifact']
+            sender_id = message['sender_id']
             
-            # Request artifact from selected agent
-            selected_agent_object = self.model.schedule.agents[selected_agent]
-            received_artifact = selected_agent_object.generate_artifact()
-            
-            # Evaluate received artifact using kNN-based novelty detection
-            interest = self.evaluate_artifact(received_artifact)
-            
-            # Update connection based on interest
-            self.update_connection(selected_agent, interest)
-            
-            # If interesting enough, add to memory and possibly adopt
-            if interest > 0.5:  # Higher threshold for others' work
-                # Store successful expression in memory
-                if len(self.artifact_memory) >= 10:
-                    self.artifact_memory.pop(0)  # Remove oldest
-                self.artifact_memory.append(received_artifact['expression'])
+            # Evaluate received artifact
+            if received_artifact['features'] is not None:
+                # Calculate novelty and interest
+                self.knn.add_feature_vectors(received_artifact['features'])
+                distances = self.knn.aggregate_distances(method='mean')
+                novelty = np.mean(list(distances.values())) if distances else 0.0
+                interest = self.hedonic_evaluation(novelty)
                 
-                # Potentially adopt and modify the expression
-                if random.random() < interest:  # More likely to adopt if more interesting
-                    self.current_expression = received_artifact['expression']._copy()
-                    self.current_expression.mutate(rate=0.1)
-                
-                # Consider adding to domain if highly interesting
+                # If interesting enough, consider for domain
                 if interest > self.model.domain_threshold:
-                    self.model.add_to_domain(received_artifact)
-        self.model.writer.add_image('Connections', self.model.connections, self.model.schedule.time, dataformats='HW')
-            
-        
+                    domain_entry = {
+                        'artifact': received_artifact,
+                        'creator_id': sender_id,
+                        'evaluator_id': self.unique_id,
+                        'novelty': novelty,
+                        'interest': interest,
+                        'timestamp': self.model.schedule.time
+                    }
+                    self.model.add_to_domain(domain_entry)
+
+        # Clear inbox
+        self.inbox = []
+        self.log_metrics(artifact)
+
 class Model(mesa.Model):
     def __init__(self, number_agents=100):
         super().__init__()
@@ -251,233 +269,139 @@ class Model(mesa.Model):
         self.schedule = mesa.time.RandomActivation(self)
         self.feature_extractor = FeatureExtractor(output_dims=64)
         self.image_generator = genart.ImageGenerator(48, 48)
-        
-        # Connection parameters
-        self.connections = np.zeros((number_agents, number_agents))
-        self.connection_density = 0.25
-        
+
+        # Thresholds
+        self.communication_threshold = 0.3  # When to share
+        self.domain_threshold = 0.5  # When to add to domain
+
         # Domain repository
         self.domain = []
-        self.domain_threshold = 0.02
-        self.max_domain_size = 1000
+        self.max_domain_size = 10000000
         
+        # Network analysis
+        self.communication_graph = nx.DiGraph()
+        self.communication_graph.add_nodes_from(range(number_agents))
+        
+        # Logging
         self.writer = SummaryWriter(log_dir=log_dir)
-        
-        # Data collection for analysis
-        self.datacollector = mesa.DataCollector(
-            model_reporters={
-                "domain_size": lambda m: len(m.domain),
-                "avg_connections": lambda m: np.mean(np.count_nonzero(m.connections, axis=1)),
-                "connection_density": lambda m: np.count_nonzero(m.connections) / (m.num_agents * m.num_agents),
-                "avg_interest": self.get_average_interest,
-                "num_cliques": self.count_cliques
-            },
-            agent_reporters={
-                "num_connections": lambda a: len(a.get_connected_agents()),
-                "memory_size": lambda a: len(a.artifact_memory),
-                "avg_connection_strength": lambda a: np.mean(np.abs(self.connections[a.unique_id]))
-            }
-        )
+        self.log_groups = {
+            'agents': {},
+            'domain': {},
+            'network': {},
+            'system': {}
+        }
         
         # Initialize agents
         self._initialize_agents()
-        # Initialize random sparse connections
-        self._initialize_connections()
-        
         self.running = True
+        
+        # Create dedicated logging directories
+        self.log_base = log_dir
+        self.image_dir = f"{log_dir}/images"
+        os.makedirs(self.image_dir, exist_ok=True)
+        
+        # Create agent-specific writers
+        self.agent_writers = {}
+        for i in range(number_agents):
+            agent_dir = f"{log_dir}/agent_{i}"
+            os.makedirs(agent_dir, exist_ok=True)
+            self.agent_writers[i] = SummaryWriter(log_dir=agent_dir)
+
+    def add_to_domain(self, entry):
+        """Enhanced domain addition with proper logging"""
+        if len(self.domain) >= self.max_domain_size:
+            self.domain.pop(0)
+        
+        artifact = entry['artifact']
+        
+        # Save the image
+        image_path = f"{self.image_dir}/domain_{len(self.domain)}.png"
+        artifact['image'].save(image_path)
+        
+        # Save the complete entry with metadata
+        domain_entry = {
+            'image_path': image_path,
+            'expression': artifact['expression'].to_string(),
+            'creator_id': entry['creator_id'],
+            'evaluator_id': entry['evaluator_id'],
+            'novelty': entry['novelty'],
+            'interest': entry['interest'],
+            'timestamp': entry['timestamp']
+        }
+        
+        self.domain.append(domain_entry)
+        
+        # Log domain metrics
+        self.writer.add_scalar('domain/total_size', len(self.domain), self.schedule.time)
+        self.writer.add_scalar('domain/last_novelty', entry['novelty'], self.schedule.time)
+        self.writer.add_scalar('domain/last_interest', entry['interest'], self.schedule.time)
+        
+
+    def log_communication(self, sender_id, recipient_id):
+        """Track communication patterns between agents"""
+        if not self.communication_graph.has_edge(sender_id, recipient_id):
+            self.communication_graph.add_edge(sender_id, recipient_id, weight=0)
+        self.communication_graph[sender_id][recipient_id]['weight'] += 1
         
     def _initialize_agents(self):
         """Create agents with normally distributed novelty preferences"""
         for i in range(self.num_agents):
             agent = Agent(i, self)
             self.schedule.add(agent)
+    
+    def log_system_metrics(self):
+        """Log system-wide metrics"""
+        step = self.schedule.time
+        
+        # Domain metrics
+        self.writer.add_scalar("domain/size", len(self.domain), step)
+        if self.domain:
+            recent_interests = [entry.get('interest_score', 0) for entry in self.domain[-100:]]
+            self.writer.add_scalar("domain/recent_avg_interest", np.mean(recent_interests), step)
+        
+        # Network metrics
+        graph = self.communication_graph
+        if len(graph.nodes) > 0:
+            # Connectivity metrics
+            density = nx.density(graph)
+            self.writer.add_scalar("network/density", density, step)
             
-    def _initialize_connections(self):
-        """Initialize sparse random connections between agents"""
-        for i in range(self.num_agents):
-            # Select random subset of other agents to connect with
-            num_connections = int(self.connection_density * self.num_agents)
-            possible_connections = list(range(self.num_agents))
-            possible_connections.remove(i)  # Remove self from possible connections
+            # Clique analysis
+            cliques = list(nx.find_cliques(graph.to_undirected()))
+            max_clique_size = len(max(cliques, key=len)) if cliques else 0
+            self.writer.add_scalar("network/max_clique_size", max_clique_size, step)
             
-            initial_connections = np.random.choice(
-                possible_connections,
-                size=num_connections,
-                replace=False
-            )
+            # Centrality metrics
+            in_degree_centrality = nx.in_degree_centrality(graph)
+            self.writer.add_scalar("network/avg_in_degree_centrality", 
+                                np.mean(list(in_degree_centrality.values())), step)
             
-            # Initialize connections with small random weights
-            self.connections[i, initial_connections] = np.random.uniform(-0.3, 0.3, size=num_connections)
-            
-    def add_to_domain(self, artifact):
-        """Add artifact to domain repository if space available"""
-        if len(self.domain) >= self.max_domain_size:
-            self.domain.pop(0)  # Remove oldest artifact
-        
-        # Store artifact with metadata
-        artifact_entry = {
-            'artifact': artifact,
-            'timestamp': self.schedule.time,
-            'creator_id': artifact.get('creator_id'),
-            'interest_score': artifact.get('interest_score')
-        }
-        self.domain.append(artifact_entry)
-        self.writer.add_scalar('Domain Size', len(self.domain), self.schedule.time)
-        
-    def get_average_interest(self):
-        """Calculate average interest across all agents' recent interactions"""
-        if not self.schedule.agents:
-            return 0
-        
-        total_interest = 0
-        count = 0
-        for agent in self.schedule.agents:
-            if agent.artifact_memory:
-                for artifact in agent.artifact_memory:
-                    # Get features from stored expression
-                    image = self.image_generator.generate(artifact)
-                    features = self.feature_extractor.extract_features(image)
-                    total_interest += agent.hedonic_evaluation(features)
-                    count += 1
-                    
-        avg_interest = total_interest / count if count > 0 else 0
-        self.writer.add_scalar('Average Interest', avg_interest, self.schedule.time)
-                    
-        return avg_interest
-        
-    def count_cliques(self):
-        """Identify cliques in the connection network"""
-        # Convert connection matrix to binary adjacency matrix
-        adjacency = np.where(abs(self.connections) > 0.3, 1, 0)
-        
-        # Count groups of mutually connected agents
-        cliques = 0
-        visited = set()
-        
-        def find_clique(agent_id, current_clique):
-            for neighbor in np.where(adjacency[agent_id] == 1)[0]:
-                if neighbor not in visited:
-                    # Check if neighbor is connected to all clique members
-                    if all(adjacency[neighbor][member] == 1 for member in current_clique):
-                        visited.add(neighbor)
-                        find_clique(neighbor, current_clique | {neighbor})
-            
-            if len(current_clique) >= 3:  # Consider groups of 3+ as cliques
-                nonlocal cliques
-                cliques += 1
-        
-        for i in range(self.num_agents):
-            if i not in visited:
-                visited.add(i)
-                find_clique(i, {i})
-                
-        return cliques
-        
-    def get_network_stats(self):
-        """Calculate various network statistics"""
-        stats = {
-            'avg_connections': np.mean(np.count_nonzero(self.connections, axis=1)),
-            'connection_density': np.count_nonzero(self.connections) / (self.num_agents * self.num_agents),
-            'num_cliques': self.count_cliques(),
-            'avg_weight': np.mean(np.abs(self.connections[self.connections != 0]))
-        }
-        
-        for stat, value in stats.items():
-            self.writer.add_scalar(f'Network/{stat}', value, self.schedule.time)
-        return stats    
+            if graph.number_of_edges() > 0:
+                communities = nx.community.greedy_modularity_communities(graph.to_undirected())
+                self.writer.add_scalar("network/num_communities", len(communities), step)
+            else:
+                # When no edges exist, each node is its own community
+                self.writer.add_scalar("network/num_communities", len(graph.nodes), step)
     
     def step(self):
-        """Advance the model by one step"""
+        """Advance the model by one step with logging"""
         self.schedule.step()
+        self.log_system_metrics()
         
-        # Collect and log metrics each step
-        metrics = self.collect_metrics()
-        self.log_metrics(metrics)
-        self.datacollector.collect(self)
-
-    def collect_metrics(self):
-        """Collect all relevant metrics for current step"""
-        metrics = {
-            'network': self.get_network_stats(),
-            'domain': {
-                'size': len(self.domain)
-            },
-            'agents': self.get_agent_metrics(),
-            'interest': self.get_average_interest()
-        }
-        
-        print(f"\nStep {self.schedule.time} Metrics:")
-        print(f"Average Interest: {metrics['interest']:.3f}")
-        print(f"Domain Size: {metrics['domain']['size']}")
-        print(f"Network Stats:")
-        for key, val in metrics['network'].items():
-            print(f"  {key}: {val:.3f}")
-        print(f"Number of Cliques: {metrics['network']['num_cliques']}")
-        
-        return metrics
-
-    def get_agent_metrics(self):
-        """Collect metrics for all agents"""
-        metrics = {
-            'avg_connections': [],
-            'avg_memory_size': [],
-            'interest_values': []
-        }
-        
-        for agent in self.schedule.agents:
-            metrics['avg_connections'].append(len(agent.get_connected_agents()))
-            metrics['avg_memory_size'].append(len(agent.artifact_memory))
+        # Log network graph periodically (every 10 steps)
+        if self.schedule.time % 10 == 0:
+            fig = plt.figure()
+            nx.draw(self.communication_graph, with_labels=True, 
+                    node_color='lightblue', node_size=500)
+            buf = io.BytesIO()
+            plt.savefig(buf, format='png')
+            buf.seek(0)
+            img = Image.open(buf)
+            self.writer.add_image('network/graph', transforms.ToTensor()(img), self.schedule.time)
+            plt.close(fig)
             
-            # Calculate average interest for agent's memory
-            if agent.artifact_memory:
-                interests = []
-                for artifact in agent.artifact_memory[-5:]:  # Look at last 5 artifacts
-                    if isinstance(artifact, dict) and 'interest' in artifact:
-                        interests.append(artifact['interest'])
-                if interests:
-                    metrics['interest_values'].append(np.mean(interests))
-        
-        return {
-            'avg_connections': np.mean(metrics['avg_connections']),
-            'avg_memory_size': np.mean(metrics['avg_memory_size']),
-            'avg_agent_interest': np.mean(metrics['interest_values']) if metrics['interest_values'] else 0
-        }
-
-    def log_metrics(self, metrics):
-        """Log all metrics to tensorboard"""
-        # Log network metrics
-        for key, value in metrics['network'].items():
-            self.writer.add_scalar(f'Network/{key}', value, self.schedule.time)
-        
-        # Log domain metrics
-        self.writer.add_scalar('Domain/size', metrics['domain']['size'], self.schedule.time)
-        
-        # Log agent metrics
-        for key, value in metrics['agents'].items():
-            self.writer.add_scalar(f'Agents/{key}', value, self.schedule.time)
-        
-        # Log overall interest
-        self.writer.add_scalar('Interest/average', metrics['interest'], self.schedule.time)
-
-    def get_average_interest(self):
-        """Calculate average interest across all agents' recent interactions"""
-        if not self.schedule.agents:
-            return 0
-        
-        interest_values = []
-        for agent in self.schedule.agents:
-            if agent.artifact_memory:
-                # Get most recent artifacts
-                recent_artifacts = agent.artifact_memory[-5:]  # Look at last 5 artifacts
-                for artifact in recent_artifacts:
-                    if isinstance(artifact, dict) and 'interest' in artifact:
-                        interest_values.append(artifact['interest'])
-        
-        avg_interest = np.mean(interest_values) if interest_values else 0
-        return avg_interest
-        
-def run_simulation(num_agents=10, steps=50):
-    """Run a complete simulation and return results"""
+def run_simulation(num_agents=25, steps=20):
+    """Run simulation with proper cleanup"""
     print(f"\nStarting simulation with {num_agents} agents for {steps} steps")
     model = Model(num_agents)
     
@@ -487,17 +411,12 @@ def run_simulation(num_agents=10, steps=50):
             model.step()
             pbar.update(1)
     
+    # Proper cleanup of all writers
     model.writer.close()
+    for writer in model.agent_writers.values():
+        writer.close()
     
     print("\nSimulation completed!")
-    print("Final metrics:")
-    final_metrics = model.collect_metrics()
-    
-    return {
-        'model': model,
-        'model_data': model.datacollector.get_model_vars_dataframe(),
-        'agent_data': model.datacollector.get_agent_vars_dataframe()
-    }
         
 if __name__ == "__main__":
     run_simulation()
