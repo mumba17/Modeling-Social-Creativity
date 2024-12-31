@@ -21,82 +21,74 @@ class Agent(mesa.Agent):
     def __init__(self, unique_id, model):
         super().__init__(unique_id, model)
         self.unique_id = unique_id
-        self.k = 10
-        self.knn = kNN(k=self.k, agent_id=unique_id)
+        self.knn = kNN(agent_id=unique_id)
         
         # Normally distributed novelty preference
         self.preferred_novelty = np.random.normal(0.5, 0.155)
+        self.preferred_novelty = np.clip(self.preferred_novelty, 0.1, 0.9)
         
-        # Wundt curve parameters
-        self.reward_threshold = self.preferred_novelty - 0.2
-        self.punish_threshold = self.preferred_novelty + 0.2
-        self.sigmoid_steepness = 10.0
-        self.punishment_weight = 1.2
+        self.average_interest_self = []
+        self.average_interest_other = []
         
         # Generation parameters
-        self.gen_depth = np.random.randint(4, 8)
+        self.gen_depth = np.random.randint(3, 9)
         self.current_expression = None
         self.artifact_memory = []
         
+        self.reward_threshold = max(0.1, self.preferred_novelty - 0.2)
+        self.punish_threshold = min(0.9, self.preferred_novelty + 0.2)
+        self.sigmoid_steepness = 10.0
+        self.punishment_weight = 1.2
+        self.alpha = 0.5  # Interest decay rate
+        self.average_interest = 0.0
+        
+        self.boredom_threshold = 0.2
+        
+        self.init_plot = True
+        
         # Communication
         self.inbox = []
-            
-    def sigmoid(self, x, threshold):
-        """Helper function to compute sigmoid curve"""
-        return 1 / (1 + np.exp(-self.sigmoid_steepness * (x - threshold)))
         
-    def hedonic_evaluation(self, input_value):
+    def sigmoid(self, x, threshold):
+        """Helper function for Wundt curve computation"""
+        return 1 / (1 + np.exp(-self.sigmoid_steepness * (x - threshold)))
+
+    def hedonic_evaluation(self, novelty):
         """
-        Compute hedonic value based on novelty using Wundt curve.
+        Compute hedonic value from novelty using Wundt curve with proper scaling
         Returns value between -1 and 1
         """
-        # Compute novelty if features provided
-        if torch.is_tensor(input_value):
-            distances = self.knn.aggregate_distances(method='mean')
-            novelty = np.mean(list(distances.values())) if distances else 0.0
-        else:
-            novelty = float(input_value)  # Ensure float type
-            
-        # Normalize novelty to 0-1 range if needed
-        if novelty > 1.0:
-            novelty = 1.0 / (1.0 + np.log(novelty))
-            
-        # Add checks for NaN/Inf
-        if np.isnan(novelty) or np.isinf(novelty):
-            print(f"Warning: Invalid novelty value: {novelty}")
-            return 0.0
-            
-        # Compute reward and punishment components
-        try:
-            reward = self.sigmoid(novelty, self.reward_threshold)
-            punishment = self.sigmoid(novelty, self.punish_threshold)
-            
-            # Combine using the Wundt curve formula
-            hedonic_value = reward - self.punishment_weight * punishment
-            
-            # Ensure output is valid
-            if np.isnan(hedonic_value) or np.isinf(hedonic_value):
-                print(f"Warning: Invalid hedonic value calculated. R:{reward}, P:{punishment}")
-                return 0.0
-                
-            return np.clip(hedonic_value, -1, 1)
-            
-        except Exception as e:
-            print(f"Error in hedonic evaluation: {e}")
-            return 0.0
+        # Make sure novelty is between 0 and 1
+        novelty = np.clip(novelty, 0, 1)
+        
+        # Calculate reward and punishment components
+        reward = self.sigmoid(novelty, self.reward_threshold)
+        punishment = self.sigmoid(novelty, self.punish_threshold)
+        
+        # The Wundt curve is the difference between reward and punishment
+        # Scale it properly to ensure full range usage
+        hedonic_value = (reward - self.punishment_weight * punishment)
+        
+        # Scale to [-1, 1] range
+        max_possible = 1 - 0  # Max reward - min punishment
+        min_possible = 0 - self.punishment_weight  # Min reward - max punishment * weight
+        hedonic_value = 2 * (hedonic_value - min_possible) / (max_possible - min_possible) - 1
+        
+        # Update running average with proper scaling
+        self.average_interest = self.alpha * self.average_interest + (1 - self.alpha) * hedonic_value
+        
+        return hedonic_value
 
     def generate_artifact(self):
         # Generate artifact
-        if not self.current_expression or random.random() < 0.1:
-            self.current_expression = genart.ExpressionNode.create_random(depth=8)
+        if not self.current_expression:
+            self.current_expression = genart.ExpressionNode.create_random(depth=self.gen_depth)
         else:
-            if self.artifact_memory and random.random() < 0.5:
+            if self.artifact_memory:
                 parent = random.choice(self.artifact_memory)
                 if isinstance(parent, dict):
                     parent = parent['expression']
                 self.current_expression = self.current_expression.breed(parent)
-            else:
-                self.current_expression.mutate(rate=0.1)
 
         # Generate image and extract features
         try:
@@ -118,11 +110,11 @@ class Agent(mesa.Agent):
             }
             
         except Exception as e:
-            print(f"Error in generate_artifact: {e}")
+            print(f"Error in generate_artifact: {e}, Agent {self.unique_id}, Expression: {self.current_expression}, Depth: {self.gen_depth}")
             # Return safe default
             return {
                 'image': None,
-                'features': torch.zeros((1, 64), device=self.model.feature_extractor.device),
+                'features': torch.zeros((1, 32), device=self.model.feature_extractor.device),
                 'expression': self.current_expression
             }
         
@@ -131,135 +123,151 @@ class Agent(mesa.Agent):
         step = self.model.schedule.time
         writer = self.model.agent_writers[self.unique_id]
         
-        # Agent parameters
-        writer.add_scalar('parameters/preferred_novelty', self.preferred_novelty, step)
-        writer.add_scalar('parameters/reward_threshold', self.reward_threshold, step)
-        writer.add_scalar('parameters/punish_threshold', self.punish_threshold, step)
+        if artifact_data is None:
+            return
         
-        # Memory metrics
-        writer.add_scalar('memory/size', len(self.artifact_memory), step)
-        writer.add_scalar('memory/inbox_size', len(self.inbox), step)
-        
-        if artifact_data:
-            # Log generated artifact
-            image = artifact_data['image']
-            expression = artifact_data['expression'].to_string()
+        if step % 20 == 0:
             
-            # Save image
-            if image:
-                # Convert PIL image to tensor
-                image_tensor = transforms.ToTensor()(image)
-                writer.add_image('generated/current_image', image_tensor, step)
+            # Memory metrics
+            writer.add_scalar('memory/size', len(self.artifact_memory), step)
             
-            # Log expression
-            writer.add_text('generated/expression', expression, step)
-            
-            # Log novelty/interest metrics
-            distances = self.knn.aggregate_distances(method='mean')
-            if distances:
-                avg_distance = np.mean(list(distances.values()))
-                writer.add_scalar('evaluation/avg_distance', avg_distance, step)
+            if artifact_data:
+                # Log generated artifact
+                image = artifact_data['image']
+                expression = artifact_data['expression'].to_string()
                 
-            if 'novelty' in artifact_data:
-                writer.add_scalar('evaluation/novelty', artifact_data['novelty'], step)
-            if 'interest' in artifact_data:
-                writer.add_scalar('evaluation/interest', artifact_data['interest'], step)
+                # Save image
+                if image:
+                    # Convert PIL image to tensor
+                    image_tensor = transforms.ToTensor()(image)
+                    writer.add_image('generated/current_image', image_tensor, step)
+                
+                # Log expression
+                writer.add_text('generated/expression', expression, step)
+                
+                # Log novelty/interest metrics
+                distances = self.knn.aggregate_distances(method='mean')
+                if distances:
+                    avg_distance = np.mean(list(distances.values()))
+                    writer.add_scalar('evaluation/avg_distance', avg_distance, step)
+                    
+                if 'novelty' in artifact_data:
+                    writer.add_scalar('evaluation/novelty', artifact_data['novelty'], step)
+                if 'interest' in artifact_data:
+                    writer.add_scalar('evaluation/interest', artifact_data['interest'], step)
+
         
-        # Communication metrics
-        in_edges = self.model.communication_graph.in_degree(self.unique_id)
-        out_edges = self.model.communication_graph.out_degree(self.unique_id)
-        writer.add_scalar('communication/in_degree', in_edges, step)
-        writer.add_scalar('communication/out_degree', out_edges, step)
-        
-        # Add custom figure showing agent's state
-        fig = plt.figure(figsize=(10, 6))
-        plt.subplot(121)
-        plt.title(f"Agent {self.unique_id} Wundt Curve")
-        x = np.linspace(0, 1, 100)
-        y = [self.hedonic_evaluation(xi) for xi in x]
-        plt.plot(x, y)
-        plt.grid(True)
-        
-        # Convert figure to tensor
-        buf = io.BytesIO()
-        plt.savefig(buf, format='png')
-        buf.seek(0)
-        img = Image.open(buf)
-        writer.add_image('state/wundt_curve', transforms.ToTensor()(img), step)
-        plt.close(fig)
+        if not self.init_plot:
+            self.init_plot = True
+            # Add custom figure showing agent's state
+            fig = plt.figure(figsize=(10, 6))
+            plt.subplot(121)
+            plt.title(f"Agent {self.unique_id} Wundt Curve")
+            x = np.linspace(0, 1, 100)
+            y = [self.hedonic_evaluation(xi) for xi in x]
+            plt.plot(x, y)
+            plt.grid(True)
+            
+            # Convert figure to tensor
+            buf = io.BytesIO()
+            plt.savefig(buf, format='png')
+            buf.seek(0)
+            img = Image.open(buf)
+            writer.add_image('state/wundt_curve', transforms.ToTensor()(img), step)
+            plt.close(fig)
+            
+            # Agent parameters
+            writer.add_scalar('parameters/preferred_novelty', self.preferred_novelty, step)
+            writer.add_scalar('parameters/reward_threshold', self.reward_threshold, step)
+            writer.add_scalar('parameters/punish_threshold', self.punish_threshold, step)
 
     def step(self):
-        """One step of agent behavior encompassing:
-        - Artifact generation and self-evaluation 
-        - Sharing if sufficiently novel
-        - Processing received artifacts"""
-
+        """One step of agent behavior with updated boredom threshold"""
         # Generate and evaluate artifact
         artifact = self.generate_artifact()
         
         # Calculate self-evaluated novelty and interest
         if artifact['features'] is not None:
             # Add to personal experience/memory
-            self.knn.add_feature_vectors(artifact['features'])
-            
-            # Get novelty distance using kNN
-            distances = self.knn.aggregate_distances(method='mean')
-            novelty = np.mean(list(distances.values())) if distances else 0.0
-            
-            # Calculate interest using Wundt curve (hedonic function)
-            interest = self.hedonic_evaluation(novelty)
-            
-            artifact['novelty'] = novelty
-            artifact['interest'] = interest
-            
-            # If interesting enough, share with random other agent
-            if interest > self.model.communication_threshold:
-                # Package artifact with metadata
-                message = {
-                    'artifact': artifact,
-                    'sender_id': self.unique_id,
-                    'novelty': novelty,
-                    'interest': interest,
-                    'timestamp': self.model.schedule.time
-                }
+            features = artifact['features']
+            if len(features.shape) == 1:
+                features = features.unsqueeze(0)
+            elif len(features.shape) == 3:
+                features = features.squeeze(1)
                 
-                # Select random recipient that isn't self
-                other_agents = [a for a in self.model.schedule.agents 
-                            if a.unique_id != self.unique_id]
-                if other_agents:
-                    recipient = self.random.choice(other_agents)
-                    recipient.inbox.append(message)
-                    
-                    # Log communication for analysis
-                    self.model.log_communication(self.unique_id, recipient.unique_id)
-
-        # Process inbox
-        for message in self.inbox:
-            received_artifact = message['artifact']
-            sender_id = message['sender_id']
+            self.knn.add_feature_vectors(features)
+            self.artifact_memory.append(artifact)
             
-            # Evaluate received artifact
-            if received_artifact['features'] is not None:
-                # Calculate novelty and interest
-                self.knn.add_feature_vectors(received_artifact['features'])
-                distances = self.knn.aggregate_distances(method='mean')
-                novelty = np.mean(list(distances.values())) if distances else 0.0
+            # Get novelty using batch method for consistency
+            try:
+                novelty_scores = self.knn.batch_get_novelty(features)
+                novelty = novelty_scores[0].item()
+                
+                # Calculate interest using Wundt curve
                 interest = self.hedonic_evaluation(novelty)
+                self.average_interest_self.append(interest)
                 
-                # If interesting enough, consider for domain
-                if interest > self.model.domain_threshold:
-                    domain_entry = {
-                        'artifact': received_artifact,
-                        'creator_id': sender_id,
-                        'evaluator_id': self.unique_id,
-                        'novelty': novelty,
-                        'interest': interest,
+                # Log metrics
+                artifact['novelty'] = novelty
+                artifact['interest'] = interest
+                
+                # If interesting enough, share with random other agents
+                if interest > self.model.self_threshold:
+                    message = {
+                        'artifact': artifact,
+                        'sender_id': self.unique_id,
                         'timestamp': self.model.schedule.time
                     }
-                    self.model.add_to_domain(domain_entry)
+                    
+                    other_agents = [a for a in self.model.schedule.agents 
+                                if a.unique_id != self.unique_id]
+                    if other_agents:
+                        for _ in range(8):  # Share with 8 random agents
+                            recipient = self.random.choice(other_agents)
+                            recipient.inbox.append(message)
+            
+            except Exception as e:
+                print(f"Error in agent step: {e}")
+                print(f"Features shape: {features.shape}")
+                interest = 0.0
+                
+            # Update accumulated interest with more detailed logging
+            old_interest = self.average_interest
+            self.average_interest = self.alpha * self.average_interest + (1 - self.alpha) * interest
+            
+            # Log interest changes in agent's writer
+            writer = self.model.agent_writers[self.unique_id]
+            writer.add_scalar('interest/current', interest, self.model.schedule.time)
+            writer.add_scalar('interest/average', self.average_interest, self.model.schedule.time)
+            writer.add_scalar('interest/delta', self.average_interest - old_interest, self.model.schedule.time)
+            
+            # Check for boredom using model's dynamic threshold
+            if self.average_interest < self.model.boredom_threshold:
+                # Retrieve artifact from domain
+                domain_artifact = self.model.get_random_domain_artifact()
+                if domain_artifact:
+                    domain_features = domain_artifact['features']
+                    if len(domain_features.shape) == 1:
+                        domain_features = domain_features.unsqueeze(0)
+                    elif len(domain_features.shape) == 3:
+                        domain_features = domain_features.squeeze(1)
+                        
+                    domain_novelty_scores = self.knn.batch_get_novelty(domain_features)
+                    domain_novelty = domain_novelty_scores[0].item()
+                    domain_interest = self.hedonic_evaluation(domain_novelty)
+                    
+                    # Log domain interaction
+                    writer.add_scalar('domain/interaction_novelty', domain_novelty, self.model.schedule.time)
+                    writer.add_scalar('domain/interaction_interest', domain_interest, self.model.schedule.time)
+                    
+                    # If interesting enough, adopt it
+                    if domain_interest > interest:
+                        self.current_expression = domain_artifact['expression']
+                        self.knn.add_feature_vectors(domain_features)
+                        writer.add_scalar('domain/adoption', 1.0, self.model.schedule.time)
+                    else:
+                        writer.add_scalar('domain/adoption', 0.0, self.model.schedule.time)
 
-        # Clear inbox
-        self.inbox = []
         self.log_metrics(artifact)
 
 class Model(mesa.Model):
@@ -267,20 +275,21 @@ class Model(mesa.Model):
         super().__init__()
         self.num_agents = number_agents
         self.schedule = mesa.time.RandomActivation(self)
-        self.feature_extractor = FeatureExtractor(output_dims=64)
-        self.image_generator = genart.ImageGenerator(48, 48)
+        self.feature_extractor = FeatureExtractor(output_dims=32)
+        self.image_generator = genart.ImageGenerator(32, 32)
 
         # Thresholds
-        self.communication_threshold = 0.3  # When to share
-        self.domain_threshold = 0.5  # When to add to domain
+        self.self_threshold = None  # When to share
+        self.domain_threshold = None  # When to add to domain
+        
+        self.interest_threshold_self_list = []
+        self.interest_threshold_other_list = []
+        
+        self.communication_matrix = np.zeros((number_agents, number_agents))
 
         # Domain repository
         self.domain = []
         self.max_domain_size = 10000000
-        
-        # Network analysis
-        self.communication_graph = nx.DiGraph()
-        self.communication_graph.add_nodes_from(range(number_agents))
         
         # Logging
         self.writer = SummaryWriter(log_dir=log_dir)
@@ -306,6 +315,55 @@ class Model(mesa.Model):
             agent_dir = f"{log_dir}/agent_{i}"
             os.makedirs(agent_dir, exist_ok=True)
             self.agent_writers[i] = SummaryWriter(log_dir=agent_dir)
+            
+    def calculate_novelty_threshold(self):
+        """Calculate thresholds based on interest distributions from all agents in current step"""
+        window_size = 100  # Window size for rolling calculations
+        
+        # Get average interest values from this step from all agents
+        step_interests_self = [np.mean(agent.average_interest_self[-window_size:]) 
+                            for agent in self.schedule.agents 
+                            if agent.average_interest_self]
+        
+        step_interests_other = [np.mean(agent.average_interest_other[-window_size:]) 
+                            for agent in self.schedule.agents
+                            if agent.average_interest_other]
+        
+        # Get current average interests for boredom calculation
+        current_interests = [agent.average_interest 
+                            for agent in self.schedule.agents]
+
+        # Calculate percentile-based thresholds if we have values
+        if step_interests_self:
+            self.self_threshold = np.percentile(step_interests_self, 80)  # 80th percentile for sharing
+        else:
+            self.self_threshold = 0.1
+
+        if step_interests_other:
+            self.domain_threshold = np.percentile(step_interests_other, 80)  # 80th percentile for domain
+        else:
+            self.domain_threshold = 0.1
+            
+        if current_interests:
+            self.boredom_threshold = np.percentile(current_interests, 10)  # 10th percentile for boredom
+        else:
+            self.boredom_threshold = 0.2
+
+        # Log all thresholds
+        self.writer.add_scalar('thresholds/communication', self.self_threshold, self.schedule.time)
+        self.writer.add_scalar('thresholds/domain', self.domain_threshold, self.schedule.time)
+        self.writer.add_scalar('thresholds/boredom', self.boredom_threshold, self.schedule.time)
+        
+        # Log distribution statistics
+        if current_interests:
+            self.writer.add_scalar('interest/mean', np.mean(current_interests), self.schedule.time)
+            self.writer.add_scalar('interest/median', np.median(current_interests), self.schedule.time)
+            self.writer.add_scalar('interest/std', np.std(current_interests), self.schedule.time)
+            
+            # Calculate percentage of bored agents
+            bored_agents = sum(1 for i in current_interests if i < self.boredom_threshold)
+            bored_percentage = (bored_agents / len(current_interests)) * 100
+            self.writer.add_scalar('agents/bored_percentage', bored_percentage, self.schedule.time)
 
     def add_to_domain(self, entry):
         """Enhanced domain addition with proper logging"""
@@ -333,15 +391,116 @@ class Model(mesa.Model):
         
         # Log domain metrics
         self.writer.add_scalar('domain/total_size', len(self.domain), self.schedule.time)
-        self.writer.add_scalar('domain/last_novelty', entry['novelty'], self.schedule.time)
         self.writer.add_scalar('domain/last_interest', entry['interest'], self.schedule.time)
+        self.writer.add_scalar('domain/last_novelty', entry['novelty'], self.schedule.time)
         
+    def get_random_domain_artifact(self):
+        """Return random artifact from domain if available"""
+        if self.domain:
+            domain_entry = random.choice(self.domain)
+            # Need to reconstruct artifact structure
+            return {
+                'features': self.feature_extractor.extract_features(Image.open(domain_entry['image_path'])),
+                'expression': genart.ExpressionNode.from_string(domain_entry['expression']),
+                'image': Image.open(domain_entry['image_path'])
+            }
+        return None
+    
+    def process_inboxes_parallel(self):
+        """Process all agent inboxes in parallel using CUDA streams"""
+        if not torch.cuda.is_available():
+            # Fallback to regular processing if CUDA not available
+            self.process_inboxes_batch()
+            return
 
-    def log_communication(self, sender_id, recipient_id):
-        """Track communication patterns between agents"""
-        if not self.communication_graph.has_edge(sender_id, recipient_id):
-            self.communication_graph.add_edge(sender_id, recipient_id, weight=0)
-        self.communication_graph[sender_id][recipient_id]['weight'] += 1
+        # Group messages by recipient
+        agent_messages = {}
+        for agent in self.schedule.agents:
+            if agent.inbox:
+                agent_messages[agent.unique_id] = {
+                    'agent': agent,
+                    'messages': agent.inbox
+                }
+        
+        if not agent_messages:
+            return
+
+        # Create streams for each agent
+        streams = {agent_id: torch.cuda.Stream() for agent_id in agent_messages.keys()}
+        
+        # Process each agent's messages in parallel streams
+        results = {}  # Store computation results
+        
+        for agent_id, data in agent_messages.items():
+            agent = data['agent']
+            messages = data['messages']
+            stream = streams[agent_id]
+            
+            with torch.cuda.stream(stream):
+                try:
+                    # Collect features
+                    features_list = []
+                    valid_messages = []
+                    
+                    for msg in messages:
+                        if msg['artifact']['features'] is not None:
+                            features = msg['artifact']['features']
+                            features_list.append(features)
+                            valid_messages.append(msg)
+                    
+                    if not features_list:
+                        continue
+                    
+                    # Stack features and move to GPU in this stream
+                    batch_features = torch.stack(features_list).cuda(non_blocking=True)
+                    
+                    # Get novelty scores
+                    novelty_scores = agent.knn.batch_get_novelty_stream(batch_features, stream)
+                    
+                    # Store results for later processing
+                    results[agent_id] = {
+                        'agent': agent,
+                        'messages': valid_messages,
+                        'novelty_scores': novelty_scores
+                    }
+                    
+                except Exception as e:
+                    print(f"Error in stream processing for agent {agent_id}: {e}")
+        
+        # Synchronize all streams
+        torch.cuda.synchronize()
+        
+        # Process results after all computations are done
+        for agent_id, result in results.items():
+            agent = result['agent']
+            valid_messages = result['messages']
+            novelty_scores = result['novelty_scores']
+            
+            try:
+                # Process each message with its novelty score
+                for msg, novelty in zip(valid_messages, novelty_scores):
+                    interest = agent.hedonic_evaluation(novelty.item())
+                    
+                    if interest > self.domain_threshold:
+                        features_to_add = msg['artifact']['features']
+                        agent.knn.add_feature_vectors(features_to_add)
+                        domain_entry = {
+                            'artifact': msg['artifact'],
+                            'creator_id': msg['sender_id'],
+                            'evaluator_id': agent_id,
+                            'novelty': novelty.item(),
+                            'interest': interest,
+                            'timestamp': self.schedule.time
+                        }
+                        self.add_to_domain(domain_entry)
+                    
+                    agent.average_interest_other.append(interest)
+                    
+            except Exception as e:
+                print(f"Error processing results for agent {agent_id}: {e}")
+            
+            # Clear processed messages
+            agent.inbox = []
         
     def _initialize_agents(self):
         """Create agents with normally distributed novelty preferences"""
@@ -358,49 +517,14 @@ class Model(mesa.Model):
         if self.domain:
             recent_interests = [entry.get('interest_score', 0) for entry in self.domain[-100:]]
             self.writer.add_scalar("domain/recent_avg_interest", np.mean(recent_interests), step)
-        
-        # Network metrics
-        graph = self.communication_graph
-        if len(graph.nodes) > 0:
-            # Connectivity metrics
-            density = nx.density(graph)
-            self.writer.add_scalar("network/density", density, step)
-            
-            # Clique analysis
-            cliques = list(nx.find_cliques(graph.to_undirected()))
-            max_clique_size = len(max(cliques, key=len)) if cliques else 0
-            self.writer.add_scalar("network/max_clique_size", max_clique_size, step)
-            
-            # Centrality metrics
-            in_degree_centrality = nx.in_degree_centrality(graph)
-            self.writer.add_scalar("network/avg_in_degree_centrality", 
-                                np.mean(list(in_degree_centrality.values())), step)
-            
-            if graph.number_of_edges() > 0:
-                communities = nx.community.greedy_modularity_communities(graph.to_undirected())
-                self.writer.add_scalar("network/num_communities", len(communities), step)
-            else:
-                # When no edges exist, each node is its own community
-                self.writer.add_scalar("network/num_communities", len(graph.nodes), step)
     
     def step(self):
-        """Advance the model by one step with logging"""
+        # First process all inboxes in batch
+        self.process_inboxes_parallel()
+        self.calculate_novelty_threshold()
         self.schedule.step()
-        self.log_system_metrics()
-        
-        # Log network graph periodically (every 10 steps)
-        if self.schedule.time % 10 == 0:
-            fig = plt.figure()
-            nx.draw(self.communication_graph, with_labels=True, 
-                    node_color='lightblue', node_size=500)
-            buf = io.BytesIO()
-            plt.savefig(buf, format='png')
-            buf.seek(0)
-            img = Image.open(buf)
-            self.writer.add_image('network/graph', transforms.ToTensor()(img), self.schedule.time)
-            plt.close(fig)
             
-def run_simulation(num_agents=25, steps=20):
+def run_simulation(num_agents=100, steps=10000):
     """Run simulation with proper cleanup"""
     print(f"\nStarting simulation with {num_agents} agents for {steps} steps")
     model = Model(num_agents)
