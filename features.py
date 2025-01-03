@@ -39,7 +39,7 @@ class FeatureExtractor(nn.Module):
         
         # Calculate feature dimensions using GPU if available
         with torch.no_grad():
-            dummy_input = torch.randn(1, 3, 48, 48).to(self.device)
+            dummy_input = torch.randn(1, 3, 32, 32).to(self.device)
             dummy_features = self.features(dummy_input)
             dummy_pooled = self.pooling(dummy_features)
             dummy_flat = torch.flatten(dummy_pooled, 1)
@@ -72,7 +72,7 @@ class FeatureExtractor(nn.Module):
             # Convert PIL Image to tensor if needed
             if isinstance(x, Image.Image):
                 transform = torchvision.transforms.Compose([
-                    torchvision.transforms.Resize((48, 48)),
+                    torchvision.transforms.Resize((32, 32)),
                     torchvision.transforms.ToTensor(),
                 ])
                 x = transform(x).unsqueeze(0)
@@ -93,11 +93,11 @@ class FeatureExtractor(nn.Module):
 
 if __name__ == "__main__":
     # Set up model
-    extractor = FeatureExtractor(output_dims=48)
+    extractor = FeatureExtractor(output_dims=32)
     
     # Test single image
     try:
-        image = torch.randn(1, 3, 48, 48)
+        image = torch.randn(1, 3, 32, 32)
         features = extractor.extract_features(image)
         print(f"Single image feature shape: {features.shape}")
         
@@ -106,6 +106,9 @@ if __name__ == "__main__":
         print("\nCurrent GPU Memory Usage:")
         print(f"Allocated: {memory_usage['allocated']}MB")
         print(f"Cached: {memory_usage['cached']}MB")
+        
+        print("Resnet output:")
+        print(features)
         
     except RuntimeError as e:
         print(f"Error during processing: {e}")

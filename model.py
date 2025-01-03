@@ -23,10 +23,6 @@ class Agent(mesa.Agent):
         self.unique_id = unique_id
         self.knn = kNN(agent_id=unique_id)
         
-        # Normally distributed novelty preference
-        self.preferred_novelty = np.random.normal(0.5, 0.155)
-        self.preferred_novelty = np.clip(self.preferred_novelty, 0.1, 0.9)
-        
         self.average_interest_self = []
         self.average_interest_other = []
         
@@ -35,11 +31,18 @@ class Agent(mesa.Agent):
         self.current_expression = None
         self.artifact_memory = []
         
-        self.reward_threshold = max(0.1, self.preferred_novelty - 0.2)
-        self.punish_threshold = min(0.9, self.preferred_novelty + 0.2)
+        # Normally distributed novelty preference
+        self.preferred_novelty = np.random.normal(0.5, 0.155)
+        self.preferred_novelty = np.clip(self.preferred_novelty, 0, 1)
+        
+        #Calculate reward and punishment thresholds
+        offset_alpha = 0.8
+        offset = offset_alpha * min(self.preferred_novelty, 1 - self.preferred_novelty)
+        self.reward_threshold = max(0, self.preferred_novelty - offset)
+        self.punish_threshold = min(1, self.preferred_novelty + offset)
         self.sigmoid_steepness = 10.0
         self.punishment_weight = 1.2
-        self.alpha = 0.5  # Interest decay rate
+        self.alpha = 0.4
         self.average_interest = 0.0
         
         self.boredom_threshold = 0.2
@@ -126,7 +129,7 @@ class Agent(mesa.Agent):
         if artifact_data is None:
             return
         
-        if step % 20 == 0:
+        if step % 100 == 0:
             
             # Memory metrics
             writer.add_scalar('memory/size', len(self.artifact_memory), step)
@@ -142,14 +145,11 @@ class Agent(mesa.Agent):
                     image_tensor = transforms.ToTensor()(image)
                     writer.add_image('generated/current_image', image_tensor, step)
                 
-                # Log expression
-                writer.add_text('generated/expression', expression, step)
-                
-                # Log novelty/interest metrics
-                distances = self.knn.aggregate_distances(method='mean')
-                if distances:
-                    avg_distance = np.mean(list(distances.values()))
-                    writer.add_scalar('evaluation/avg_distance', avg_distance, step)
+                # # Log novelty/interest metrics
+                # distances = self.knn.aggregate_distances(method='mean')
+                # if distances:
+                #     avg_distance = np.mean(list(distances.values()))
+                #     writer.add_scalar('evaluation/avg_distance', avg_distance, step)
                     
                 if 'novelty' in artifact_data:
                     writer.add_scalar('evaluation/novelty', artifact_data['novelty'], step)
@@ -233,7 +233,7 @@ class Agent(mesa.Agent):
                 
             # Update accumulated interest with more detailed logging
             old_interest = self.average_interest
-            self.average_interest = self.alpha * self.average_interest + (1 - self.alpha) * interest
+            self.average_interest = (self.alpha * self.average_interest) + ((1 - self.alpha) * interest)
             
             # Log interest changes in agent's writer
             writer = self.model.agent_writers[self.unique_id]
@@ -256,17 +256,22 @@ class Agent(mesa.Agent):
                     domain_novelty = domain_novelty_scores[0].item()
                     domain_interest = self.hedonic_evaluation(domain_novelty)
                     
-                    # Log domain interaction
-                    writer.add_scalar('domain/interaction_novelty', domain_novelty, self.model.schedule.time)
-                    writer.add_scalar('domain/interaction_interest', domain_interest, self.model.schedule.time)
+                    # Log domain interaction with better naming
+                    writer = self.model.agent_writers[self.unique_id]
+                    writer.add_scalar('domain_interaction/novelty_from_domain', domain_novelty, self.model.schedule.time)
+                    writer.add_scalar('domain_interaction/interest_from_domain', domain_interest, self.model.schedule.time)
                     
                     # If interesting enough, adopt it
-                    if domain_interest > interest:
+                    if domain_interest > self.average_interest:
                         self.current_expression = domain_artifact['expression']
                         self.knn.add_feature_vectors(domain_features)
-                        writer.add_scalar('domain/adoption', 1.0, self.model.schedule.time)
-                    else:
-                        writer.add_scalar('domain/adoption', 0.0, self.model.schedule.time)
+                        # Reset average interest to domain novelty value after adoption
+                        self.average_interest = domain_novelty
+                        writer.add_scalar('domain_interaction/cumulative_adoptions', 
+                                self.model.agent_adoption_counts[self.unique_id], 
+                                self.model.schedule.time)
+                        self.model.agent_adoption_counts[self.unique_id] += 1
+                        
 
         self.log_metrics(artifact)
 
@@ -275,8 +280,10 @@ class Model(mesa.Model):
         super().__init__()
         self.num_agents = number_agents
         self.schedule = mesa.time.RandomActivation(self)
-        self.feature_extractor = FeatureExtractor(output_dims=32)
+        self.feature_extractor = FeatureExtractor(output_dims=16)
         self.image_generator = genart.ImageGenerator(32, 32)
+        
+        self.agent_adoption_counts = np.zeros(number_agents)
 
         # Thresholds
         self.self_threshold = None  # When to share
@@ -315,6 +322,32 @@ class Model(mesa.Model):
             agent_dir = f"{log_dir}/agent_{i}"
             os.makedirs(agent_dir, exist_ok=True)
             self.agent_writers[i] = SummaryWriter(log_dir=agent_dir)
+            
+        # Connection tracking matrices
+        self.connection_matrix = np.zeros((number_agents, number_agents))
+        self.cumulative_matrix = np.zeros((number_agents, number_agents))
+        
+        # Agent contribution tracking 
+        self.domain_contributions = np.zeros(number_agents)
+        self.agent_contribution_history = {i: [] for i in range(number_agents)}
+        self.agent_success_rates = np.zeros(number_agents)
+        
+    def update_connection_strength(self, sender_id, receiver_id, success=True):
+        """Update connection strength between agents"""
+        if success:
+            self.connection_matrix[sender_id][receiver_id] += 1
+            self.cumulative_matrix[sender_id][receiver_id] += 1
+            self.agent_success_rates[sender_id] += 1
+            
+            # Log individual connection
+            self.writer.add_scalar(f'connections/agent_{sender_id}/to_{receiver_id}', 
+                                self.cumulative_matrix[sender_id][receiver_id], 
+                                self.schedule.time)
+            
+            # Log agent success rate
+            self.writer.add_scalar(f'agents/success_rate_{sender_id}', 
+                                self.agent_success_rates[sender_id],
+                                self.schedule.time)
             
     def calculate_novelty_threshold(self):
         """Calculate thresholds based on interest distributions from all agents in current step"""
@@ -371,11 +404,21 @@ class Model(mesa.Model):
             self.domain.pop(0)
         
         artifact = entry['artifact']
+        creator_id = entry['creator_id']
+        self.domain_contributions[creator_id] += 1
+        self.agent_contribution_history[creator_id].append(self.schedule.time)
+        
+        self.writer.add_scalar(f'agents/contributions/agent_{creator_id}', 
+                          self.domain_contributions[creator_id],
+                          self.schedule.time)
+        
         
         # Save the image
-        image_path = f"{self.image_dir}/domain_{len(self.domain)}.png"
-        artifact['image'].save(image_path)
-        
+        # Name it based on all the artifact variables: 
+        image_filename = f"domain_id-{len(self.domain)}_creator-{entry['creator_id']}_evaluator-{entry['evaluator_id']}_nov-{entry['novelty']}_int-{entry['interest']}.png"
+        image_filename = image_filename.replace(" ", "_").replace("/", "-")  # Ensure filename-safe characters
+        image_path = f"{self.image_dir}/{image_filename}"
+
         # Save the complete entry with metadata
         domain_entry = {
             'image_path': image_path,
@@ -387,6 +430,7 @@ class Model(mesa.Model):
             'timestamp': entry['timestamp']
         }
         
+        artifact['image'].save(image_path)
         self.domain.append(domain_entry)
         
         # Log domain metrics
@@ -509,22 +553,60 @@ class Model(mesa.Model):
             self.schedule.add(agent)
     
     def log_system_metrics(self):
-        """Log system-wide metrics"""
+        """Enhanced system-wide metrics logging"""
         step = self.schedule.time
         
         # Domain metrics
         self.writer.add_scalar("domain/size", len(self.domain), step)
-        if self.domain:
-            recent_interests = [entry.get('interest_score', 0) for entry in self.domain[-100:]]
-            self.writer.add_scalar("domain/recent_avg_interest", np.mean(recent_interests), step)
+        
+        # Enhanced top contributors logging
+        if step % 25 == 0:  # Update every 10 steps
+            top_contributors = np.argsort(self.domain_contributions)[-8:][::-1]
+            for rank, agent_id in enumerate(top_contributors):
+                contrib_count = len(self.agent_contribution_history[agent_id])
+                self.writer.add_text(f'top_contributors/rank_{rank}', 
+                                f'Agent {agent_id} (Total contributions: {contrib_count})', 
+                                step)
+                self.writer.add_scalar(f'top_contributors/agent_{agent_id}/contribution_count', 
+                                    contrib_count,
+                                    step)
+                self.writer.add_scalar(f'top_contributors/agent_{agent_id}/current_rank', 
+                                    rank,
+                                    step)
     
     def step(self):
         # First process all inboxes in batch
         self.process_inboxes_parallel()
         self.calculate_novelty_threshold()
+        
+        if self.schedule.time % 1 == 0:
+            # Log overall network density
+            connections = np.count_nonzero(self.connection_matrix)
+            total_possible = self.num_agents * (self.num_agents - 1)
+            network_density = connections / total_possible
+            self.writer.add_scalar('network/density', network_density, self.schedule.time)
+            
+            # Log top contributing agents
+            top_contributors = np.argsort(self.domain_contributions)[-5:][::-1]
+            for rank, agent_id in enumerate(top_contributors):
+                self.writer.add_scalar(f'top_contributors/rank_{rank}', 
+                                    agent_id,
+                                    self.schedule.time)
+                self.writer.add_scalar(f'top_contributors/score_{rank}', 
+                                    self.domain_contributions[agent_id],
+                                    self.schedule.time)
+            
+            # Log overall connection strengths
+            self.writer.add_scalar('network/total_connections', 
+                                np.sum(self.connection_matrix),
+                                self.schedule.time)
+            self.writer.add_scalar('network/average_strength',
+                                np.mean(self.connection_matrix[self.connection_matrix > 0]),
+                                self.schedule.time)
+            
         self.schedule.step()
             
-def run_simulation(num_agents=100, steps=10000):
+def run_simulation(num_agents=250, steps=100000):
     """Run simulation with proper cleanup"""
     print(f"\nStarting simulation with {num_agents} agents for {steps} steps")
     model = Model(num_agents)
@@ -534,6 +616,20 @@ def run_simulation(num_agents=100, steps=10000):
             print(f"\nStep {step+1}/{steps}")
             model.step()
             pbar.update(1)
+            
+    # Save communication matrix
+    comm_matrix_path = f"{model.log_base}/communication_matrix.npy"
+    np.save(comm_matrix_path, model.cumulative_matrix)
+    
+    # Save additional network analysis data
+    network_data = {
+        'communication_matrix': model.cumulative_matrix,
+        'domain_contributions': model.domain_contributions,
+        'agent_adoption_counts': model.agent_adoption_counts,
+        'agent_contribution_history': model.agent_contribution_history
+    }
+    network_data_path = f"{model.log_base}/network_analysis.npz"
+    np.savez(network_data_path, **network_data)
     
     # Proper cleanup of all writers
     model.writer.close()
