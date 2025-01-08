@@ -26,6 +26,7 @@ class Agent(mesa.Agent):
         self.average_interest_self = []
         self.average_interest_other = []
         
+        
         # Generation parameters
         self.gen_depth = np.random.randint(3, 9)
         self.current_expression = None
@@ -40,14 +41,14 @@ class Agent(mesa.Agent):
         offset = offset_alpha * min(self.preferred_novelty, 1 - self.preferred_novelty)
         self.reward_threshold = max(0, self.preferred_novelty - offset)
         self.punish_threshold = min(1, self.preferred_novelty + offset)
-        self.sigmoid_steepness = 10.0
-        self.punishment_weight = 1.2
-        self.alpha = 0.4
+        self.sigmoid_steepness = 5
+        self.punishment_weight = 1.5
+        self.alpha = 0.35
         self.average_interest = 0.0
         
         self.boredom_threshold = 0.2
         
-        self.init_plot = True
+        self.init_plot = False
         
         # Communication
         self.inbox = []
@@ -131,9 +132,6 @@ class Agent(mesa.Agent):
         
         if step % 100 == 0:
             
-            # Memory metrics
-            writer.add_scalar('memory/size', len(self.artifact_memory), step)
-            
             if artifact_data:
                 # Log generated artifact
                 image = artifact_data['image']
@@ -195,13 +193,14 @@ class Agent(mesa.Agent):
             elif len(features.shape) == 3:
                 features = features.squeeze(1)
                 
-            self.knn.add_feature_vectors(features)
+            self.knn.add_feature_vectors(features, self.model.schedule.time)
             self.artifact_memory.append(artifact)
             
             # Get novelty using batch method for consistency
             try:
                 novelty_scores = self.knn.batch_get_novelty(features)
                 novelty = novelty_scores[0].item()
+                novelty = self.model.normalise_novelty(novelty)
                 
                 # Calculate interest using Wundt curve
                 interest = self.hedonic_evaluation(novelty)
@@ -241,6 +240,8 @@ class Agent(mesa.Agent):
             writer.add_scalar('interest/average', self.average_interest, self.model.schedule.time)
             writer.add_scalar('interest/delta', self.average_interest - old_interest, self.model.schedule.time)
             
+            writer.add_scalar('agents/last_k', self.knn.k, self.model.schedule.time)
+            
             # Check for boredom using model's dynamic threshold
             if self.average_interest < self.model.boredom_threshold:
                 # Retrieve artifact from domain
@@ -254,6 +255,7 @@ class Agent(mesa.Agent):
                         
                     domain_novelty_scores = self.knn.batch_get_novelty(domain_features)
                     domain_novelty = domain_novelty_scores[0].item()
+                    domain_novelty = self.model.normalise_novelty(domain_novelty)
                     domain_interest = self.hedonic_evaluation(domain_novelty)
                     
                     # Log domain interaction with better naming
@@ -264,7 +266,7 @@ class Agent(mesa.Agent):
                     # If interesting enough, adopt it
                     if domain_interest > self.average_interest:
                         self.current_expression = domain_artifact['expression']
-                        self.knn.add_feature_vectors(domain_features)
+                        self.knn.add_feature_vectors(domain_features, self.model.schedule.time)
                         # Reset average interest to domain novelty value after adoption
                         self.average_interest = domain_novelty
                         writer.add_scalar('domain_interaction/cumulative_adoptions', 
@@ -280,7 +282,7 @@ class Model(mesa.Model):
         super().__init__()
         self.num_agents = number_agents
         self.schedule = mesa.time.RandomActivation(self)
-        self.feature_extractor = FeatureExtractor(output_dims=16)
+        self.feature_extractor = FeatureExtractor(output_dims=64)
         self.image_generator = genart.ImageGenerator(32, 32)
         
         self.agent_adoption_counts = np.zeros(number_agents)
@@ -288,6 +290,9 @@ class Model(mesa.Model):
         # Thresholds
         self.self_threshold = None  # When to share
         self.domain_threshold = None  # When to add to domain
+
+        self.novelty_values = []
+        self.novelty_values_normalized = []
         
         self.interest_threshold_self_list = []
         self.interest_threshold_other_list = []
@@ -523,11 +528,12 @@ class Model(mesa.Model):
             try:
                 # Process each message with its novelty score
                 for msg, novelty in zip(valid_messages, novelty_scores):
-                    interest = agent.hedonic_evaluation(novelty.item())
+                    novelty_score = self.normalise_novelty(novelty.item())
+                    interest = agent.hedonic_evaluation(novelty_score)
                     
                     if interest > self.domain_threshold:
                         features_to_add = msg['artifact']['features']
-                        agent.knn.add_feature_vectors(features_to_add)
+                        agent.knn.add_feature_vectors(features_to_add, self.schedule.time)
                         domain_entry = {
                             'artifact': msg['artifact'],
                             'creator_id': msg['sender_id'],
@@ -545,6 +551,36 @@ class Model(mesa.Model):
             
             # Clear processed messages
             agent.inbox = []
+    
+    def normalise_novelty(self, novelty):
+        """
+        Normalize a single novelty value to be between 0 and 1
+        based on the average of the top 1% and bottom 99% of previously
+        observed novelty scores in self.novelty_values (to prevent outliers).
+        
+        Args:
+            novelty (float): The novelty score to be normalized.
+            
+        Returns:
+            float: The normalized novelty value (between 0 and 1).
+        """
+        # Add the new novelty value to the tracked list
+        self.novelty_values.append(novelty)
+
+        # Calculate the 1st and 99th percentiles for bounds
+        bottom_1_percentile = np.percentile(self.novelty_values, 1)
+        top_99_percentile = np.percentile(self.novelty_values, 99)
+
+        # Normalize the input novelty value using these bounds
+        normalized_novelty = (novelty - bottom_1_percentile) / (top_99_percentile - bottom_1_percentile + 1e-8)
+
+        # Clip to ensure the value is between 0 and 1
+        normalized_novelty = np.clip(normalized_novelty, 0, 1)
+        
+        self.novelty_values_normalized.append(normalized_novelty)
+
+        return normalized_novelty
+
         
     def _initialize_agents(self):
         """Create agents with normally distributed novelty preferences"""
@@ -606,7 +642,7 @@ class Model(mesa.Model):
             
         self.schedule.step()
             
-def run_simulation(num_agents=250, steps=100000):
+def run_simulation(num_agents=30, steps=2500):
     """Run simulation with proper cleanup"""
     print(f"\nStarting simulation with {num_agents} agents for {steps} steps")
     model = Model(num_agents)

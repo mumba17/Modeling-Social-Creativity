@@ -5,13 +5,167 @@ class kNN:
     def __init__(self, agent_id=None):
         """
         Initialize the kNN instance with GPU support.
-        :param k: The number of nearest neighbors to consider
+        Uses elbow method to automatically determine optimal k value.
         """
         self.agent_id = agent_id
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.feature_vectors = torch.tensor([], device=self.device)
-        self.k = min(max(int(self.feature_vectors.shape[0] * 0.1), 5), 50)  # 10% of memory size, bounded between 5 and 50
-        print(f"Initialized kNN with k={self.k} for agent {agent_id}")
+        self.k = 3  # Default initial k value
+        
+        print(f"Initialized kNN for agent {agent_id}")
+        
+    def get_max_k(self, n_samples, feature_dim=64):
+        """
+        Calculate maximum reasonable k value based on dataset size and dimensionality.
+        
+        Args:
+            n_samples: Number of data points
+            feature_dim: Dimensionality of feature vectors
+        
+        Returns:
+            int: Maximum reasonable k value
+        """
+        # Statistical rules of thumb:
+        # 1. k ≈ sqrt(n) for basic estimation
+        # 2. k should be less than n/10 to avoid oversmoothing
+        # 3. k should account for dimensionality
+        
+        sqrt_n = int(torch.sqrt(torch.tensor(n_samples)).item())
+        dim_factor = int(torch.log2(torch.tensor(feature_dim)).item())
+        
+        # Balance between sqrt(n) and dimensionality considerations
+        max_k = min(
+            sqrt_n * dim_factor,  # Scale with both size and dimensionality
+            n_samples // 10,      # Upper bound to prevent oversmoothing
+            500                   # Hard upper limit for computational efficiency
+        )
+        
+        return max(max_k, 3)  # Ensure minimum k of 3
+
+    def generate_k_values(self, max_k):
+        """
+        Generate a reasonable progression of k values to test.
+        
+        Args:
+            max_k: Maximum k value to consider
+        
+        Returns:
+            list: Sorted list of k values to test
+        """
+        k_values = []
+        
+        if max_k < 3:
+            return [3]  # Ensure at least the minimum k
+        
+        # Start with dense sampling for small k
+        k_values.extend(range(3, min(11, max_k + 1)))
+        
+        if max_k > 10:
+            # Add values with increasing steps
+            k = 12
+            while k <= max_k:
+                if k <= 30:
+                    k_values.append(k)
+                    k += 2  # Step by 2 up to 30
+                elif k <= 100:
+                    k_values.append(k)
+                    k += 10  # Step by 10 up to 100
+                else:
+                    k_values.append(k)
+                    k += 25  # Step by 25 beyond 100
+                    
+        return sorted(list(set(k_values)))  # Remove any duplicates
+
+    def calculate_k_elbow(self):
+        """
+        Implement the elbow method to find optimal k value.
+        Uses sampling for large datasets and proper k value progression.
+        
+        Returns:
+            int: Optimal k value based on the elbow method
+        """
+        try:
+            n_samples = self.feature_vectors.shape[0]
+
+            if n_samples < 2:
+                return 3  # Default minimum k if not enough vectors
+
+            # Determine maximum k and generate test values
+            max_k = self.get_max_k(n_samples, self.feature_vectors.shape[1])
+
+            k_values = self.generate_k_values(max_k)
+            #print(f"max_k: {max_k}")  # Debug statement
+            #print(f"k_values: {k_values}")  # Debug statement
+
+            if not k_values:  # Ensure k_values is not empty
+                print("Warning: k_values is empty. Returning default k=3")
+                return 3
+
+            # Sample data if dataset is large
+            MAX_SAMPLE_SIZE = 1000
+            if n_samples > MAX_SAMPLE_SIZE:
+                indices = torch.randperm(n_samples)[:MAX_SAMPLE_SIZE]
+                vectors_sample = self.feature_vectors[indices]
+            else:
+                vectors_sample = self.feature_vectors
+
+            # Initialize tensors for distortions
+            distortions = torch.zeros(len(k_values), device=self.device)
+
+            # Normalize sampled vectors once
+            normalized_vectors = vectors_sample / (torch.norm(vectors_sample, dim=1, keepdim=True) + 1e-8)
+
+            # Calculate all pairwise distances once
+            similarities = torch.matmul(normalized_vectors, normalized_vectors.T)
+            distances = 1 - similarities
+
+            # Calculate distortion for each k
+            for idx, k in enumerate(k_values):
+                # Exclude self-similarity by setting diagonal to inf
+                distances_no_self = distances.clone()
+                distances_no_self.fill_diagonal_(float('inf'))
+
+                # Get top k distances for each point
+                top_k_distances, _ = torch.topk(distances_no_self, k, largest=False, dim=1)
+
+                # Calculate average distortion for this k
+                distortion = torch.mean(top_k_distances).item()
+                distortions[idx] = distortion
+
+                if self.device.type == "cuda":
+                    torch.cuda.empty_cache()
+
+            # Calculate the elbow point using the angle method
+            coords = torch.stack([torch.tensor(k_values, device=self.device), distortions], dim=1)
+
+            # Normalize coordinates to [0,1] range for better angle calculation
+            coords_normalized = (coords - coords.min(0)[0]) / (coords.max(0)[0] - coords.min(0)[0])
+
+            # Calculate angles between consecutive segments
+            vectors = coords_normalized[1:] - coords_normalized[:-1]
+            angles = []
+
+            for i in range(len(vectors) - 1):
+                v1 = vectors[i]
+                v2 = vectors[i + 1]
+                cos_angle = torch.dot(v1, v2) / (torch.norm(v1) * torch.norm(v2))
+                angle = torch.acos(torch.clamp(cos_angle, -1.0, 1.0))
+                angles.append(angle.item())
+
+            # Find the point with maximum angle (elbow point)
+            if not angles:  # Ensure angles is not empty
+                #print("Warning: angles is empty. Returning default k=3")
+                return 3
+
+            optimal_idx = angles.index(max(angles)) + 1
+            optimal_k = k_values[optimal_idx]
+
+            return optimal_k
+
+        except Exception as e:
+            print(f"Error in calculate_k_elbow: {e}")
+            return 3  # Return default k value on error
+
             
     def remove_feature_vectors(self, indices):
         """
@@ -167,8 +321,7 @@ class kNN:
         try:
             if self.feature_vectors.shape[0] < 2:
                 return 0.0
-                
-            self.k = min(max(int(self.feature_vectors.shape[0] * 0.1), 5), 50)
+
             #print(self.k)
                 
             # Ensure query vector is on device and has correct shape
@@ -220,8 +373,6 @@ class kNN:
         try:
             if self.feature_vectors.shape[0] < 2:
                 return torch.zeros(query_vectors.shape[0], device=self.device)
-                
-            self.k = min(max(int(self.feature_vectors.shape[0] * 0.1), 5), 50)
             
             # Ensure query vectors are on device and have correct shape
             query_vectors = query_vectors.to(self.device)
@@ -270,8 +421,6 @@ class kNN:
         try:
             if self.feature_vectors.shape[0] < 2:
                 return torch.zeros(query_vectors.shape[0], device=self.device)
-                
-            self.k = min(max(int(self.feature_vectors.shape[0] * 0.1), 5), 50)
             
             with torch.cuda.stream(stream):
                 # Ensure query vectors are on device and have correct shape
@@ -307,8 +456,10 @@ class kNN:
             print(f"Feature vectors shape: {self.feature_vectors.shape}")
             return torch.zeros(query_vectors.shape[0], device=self.device)
 
-    def add_feature_vectors(self, new_feature_vectors):
-        """Add new feature vectors with validation"""
+    def add_feature_vectors(self, new_feature_vectors, step=0):
+        """
+        Add new feature vectors and recalculate optimal k using elbow method
+        """
         try:
             new_feature_vectors = new_feature_vectors.to(self.device)
             
@@ -327,6 +478,12 @@ class kNN:
                 self.feature_vectors = new_feature_vectors
             else:
                 self.feature_vectors = torch.cat((self.feature_vectors, new_feature_vectors), dim=0)
+            
+            # Recalculate optimal k if we have enough vectors every 3 steps
+            if step % 3 == 0 and self.feature_vectors.shape[0] >= 3:
+                if self.feature_vectors.shape[0] >= 3:  # Need at least 3 points for elbow method
+                    self.k = self.calculate_k_elbow()
+                    #print(f"Recalculated optimal k = {self.k}")
             
         except Exception as e:
             print(f"Error adding feature vectors: {e}")

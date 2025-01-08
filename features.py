@@ -1,5 +1,5 @@
 import torch
-import torch.nn as nn
+import torch.nn as nn 
 import torchvision.models as models
 import torchvision
 from PIL import Image
@@ -17,6 +17,7 @@ class FeatureExtractor(nn.Module):
             print(f"Allocated: {torch.cuda.memory_allocated(0)//1024**2}MB")
             print(f"Cached: {torch.cuda.memory_reserved(0)//1024**2}MB")
         
+        # Initialize ResNet
         self.model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
         self.model.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
         self.model = self.model.to(self.device) 
@@ -27,8 +28,7 @@ class FeatureExtractor(nn.Module):
             self.model.bn1,
             self.model.relu,
             self.model.layer1,
-            self.model.layer2,
-            self.model.layer3
+            self.model.layer2
         ).to(self.device) 
         
         # Freeze parameters
@@ -37,7 +37,7 @@ class FeatureExtractor(nn.Module):
             
         self.pooling = nn.AdaptiveAvgPool2d((1, 1)).to(self.device) 
         
-        # Calculate feature dimensions using GPU if available
+        # Calculate feature dimensions
         with torch.no_grad():
             dummy_input = torch.randn(1, 3, 32, 32).to(self.device)
             dummy_features = self.features(dummy_input)
@@ -45,28 +45,56 @@ class FeatureExtractor(nn.Module):
             dummy_flat = torch.flatten(dummy_pooled, 1)
             self.feature_dims = dummy_flat.shape[1]
         
-        # Dimension reduction layers
+        # Add normalization layer after pooling
+        self.feature_norm = nn.BatchNorm1d(self.feature_dims).to(self.device)
+        
+        # Dimension reduction layers with normalization
         self.dim_reduction = nn.Sequential(
             nn.Linear(self.feature_dims, self.feature_dims // 2),
+            nn.BatchNorm1d(self.feature_dims // 2),
             nn.ReLU(),
-            nn.Linear(self.feature_dims // 2, output_dims)
+            nn.Linear(self.feature_dims // 2, output_dims),
+            nn.BatchNorm1d(output_dims),
+            # L2 normalization layer
+            nn.LayerNorm(output_dims, elementwise_affine=False)
         ).to(self.device)
         
         # Move model to appropriate device
         self.to(self.device)
+
+    def standardize_features(self, features):
+        """Standardize features using z-score normalization"""
+        mean = features.mean(dim=1, keepdim=True)
+        std = features.std(dim=1, keepdim=True) + 1e-8  # Add small epsilon to avoid division by zero
+        return (features - mean) / std
             
     def forward(self, x):
         # Ensure input is on correct device
         x = x.to(self.device)
+        
+        # Extract features
         features = self.features(x)
         features = self.pooling(features)
         features = torch.flatten(features, 1)
+        
+        # Apply batch normalization to flattened features
+        features = self.feature_norm(features)
+        
+        # Standardize features before dimension reduction
+        features = self.standardize_features(features)
+        
+        # Apply dimension reduction with built-in normalization
         features = self.dim_reduction(features)
+        
+        # Ensure output features are L2 normalized
+        features = torch.nn.functional.normalize(features, p=2, dim=1)
+        
         return features
 
     @torch.no_grad()
     def extract_features(self, x):
         self.eval()
+        
         # Handle both single images and batches
         with torch.no_grad():
             # Convert PIL Image to tensor if needed
@@ -74,14 +102,20 @@ class FeatureExtractor(nn.Module):
                 transform = torchvision.transforms.Compose([
                     torchvision.transforms.Resize((32, 32)),
                     torchvision.transforms.ToTensor(),
+                    # Add normalization for input images
+                    torchvision.transforms.Normalize(
+                        mean=[0.485, 0.456, 0.406],
+                        std=[0.229, 0.224, 0.225]
+                    )
                 ])
                 x = transform(x).unsqueeze(0)
                 
         if x.dim() == 3:
             x = x.unsqueeze(0)
+            
         x = x.to(self.device)
         features = self.forward(x)
-        return features.cpu()  # Return to CPU for further processing
+        return features.cpu()
 
     def get_memory_usage(self):
         if self.device.type == "cuda":
@@ -107,8 +141,13 @@ if __name__ == "__main__":
         print(f"Allocated: {memory_usage['allocated']}MB")
         print(f"Cached: {memory_usage['cached']}MB")
         
-        print("Resnet output:")
-        print(features)
+        # Verify normalization
+        print("\nFeature statistics:")
+        print(f"Mean: {features.mean():.4f}")
+        print(f"Std: {features.std():.4f}")
+        print(f"Min: {features.min():.4f}")
+        print(f"Max: {features.max():.4f}")
+        print(f"L2 norm: {torch.norm(features, dim=1)}")
         
     except RuntimeError as e:
         print(f"Error during processing: {e}")
