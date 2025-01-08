@@ -1,5 +1,6 @@
 import torch
 import numpy as np
+import random
 
 class kNN:
     def __init__(self, agent_id=None):
@@ -479,11 +480,13 @@ class kNN:
             else:
                 self.feature_vectors = torch.cat((self.feature_vectors, new_feature_vectors), dim=0)
             
-            # Recalculate optimal k if we have enough vectors every 3 steps
-            if step % 3 == 0 and self.feature_vectors.shape[0] >= 3:
-                if self.feature_vectors.shape[0] >= 3:  # Need at least 3 points for elbow method
-                    self.k = self.calculate_k_elbow()
-                    #print(f"Recalculated optimal k = {self.k}")
+            #Random chance of 75% of not updating k
+            if random.random() > 0.75:
+                # Recalculate optimal k if we have enough vectors every 3 steps
+                if step % 3 == 0 and self.feature_vectors.shape[0] >= 3:
+                    if self.feature_vectors.shape[0] >= 3:  # Need at least 3 points for elbow method
+                        self.k = self.calculate_k_elbow()
+                        #print(f"Recalculated optimal k = {self.k}")
             
         except Exception as e:
             print(f"Error adding feature vectors: {e}")

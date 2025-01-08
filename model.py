@@ -14,6 +14,7 @@ import io
 import networkx as nx
 import matplotlib.pyplot as plt
 from PIL import Image
+from wundtcurve import WundtCurve
 
 log_dir = f"logs/run_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_v1"
 
@@ -32,53 +33,44 @@ class Agent(mesa.Agent):
         self.current_expression = None
         self.artifact_memory = []
         
-        # Normally distributed novelty preference
+        # Initialize with normally distributed novelty preference
         self.preferred_novelty = np.random.normal(0.5, 0.155)
         self.preferred_novelty = np.clip(self.preferred_novelty, 0, 1)
         
-        #Calculate reward and punishment thresholds
-        offset_alpha = 0.8
-        offset = offset_alpha * min(self.preferred_novelty, 1 - self.preferred_novelty)
-        self.reward_threshold = max(0, self.preferred_novelty - offset)
-        self.punish_threshold = min(1, self.preferred_novelty + offset)
-        self.sigmoid_steepness = 5
-        self.punishment_weight = 1.5
+        # Set means around preferred novelty
+        reward_mean = max(0.1, self.preferred_novelty - 0.2)
+        punish_mean = min(0.9, self.preferred_novelty + 0.2)
+        
+        self.wundt = WundtCurve(
+            reward_mean=reward_mean,  # Reward mean
+            reward_std=0.15,          # Reward std dev
+            punish_mean=punish_mean,  # Punishment mean
+            punish_std=0.15,          # Punishment std dev
+            alpha=1.2                 # Punishment weight
+        )
+        
         self.alpha = 0.35
         self.average_interest = 0.0
         
         self.boredom_threshold = 0.2
         
-        self.init_plot = False
+        self.init_plot = True
         
         # Communication
         self.inbox = []
         
-    def sigmoid(self, x, threshold):
-        """Helper function for Wundt curve computation"""
-        return 1 / (1 + np.exp(-self.sigmoid_steepness * (x - threshold)))
-
     def hedonic_evaluation(self, novelty):
         """
-        Compute hedonic value from novelty using Wundt curve with proper scaling
+        Compute hedonic value from novelty using paper's Wundt curve
         Returns value between -1 and 1
         """
         # Make sure novelty is between 0 and 1
         novelty = np.clip(novelty, 0, 1)
         
-        # Calculate reward and punishment components
-        reward = self.sigmoid(novelty, self.reward_threshold)
-        punishment = self.sigmoid(novelty, self.punish_threshold)
+        # Get hedonic value from Wundt curve
+        hedonic_value = self.wundt.hedonic_value(novelty)
         
-        # The Wundt curve is the difference between reward and punishment
-        # Scale it properly to ensure full range usage
-        hedonic_value = (reward - self.punishment_weight * punishment)
-        
-        # Scale to [-1, 1] range
-        max_possible = 1 - 0  # Max reward - min punishment
-        min_possible = 0 - self.punishment_weight  # Min reward - max punishment * weight
-        hedonic_value = 2 * (hedonic_value - min_possible) / (max_possible - min_possible) - 1
-        
-        # Update running average with proper scaling
+        # Update running average
         self.average_interest = self.alpha * self.average_interest + (1 - self.alpha) * hedonic_value
         
         return hedonic_value
@@ -176,8 +168,6 @@ class Agent(mesa.Agent):
             
             # Agent parameters
             writer.add_scalar('parameters/preferred_novelty', self.preferred_novelty, step)
-            writer.add_scalar('parameters/reward_threshold', self.reward_threshold, step)
-            writer.add_scalar('parameters/punish_threshold', self.punish_threshold, step)
 
     def step(self):
         """One step of agent behavior with updated boredom threshold"""
@@ -642,7 +632,7 @@ class Model(mesa.Model):
             
         self.schedule.step()
             
-def run_simulation(num_agents=30, steps=2500):
+def run_simulation(num_agents=500, steps=2500):
     """Run simulation with proper cleanup"""
     print(f"\nStarting simulation with {num_agents} agents for {steps} steps")
     model = Model(num_agents)
