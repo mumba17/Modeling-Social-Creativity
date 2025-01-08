@@ -276,6 +276,11 @@ class Model(mesa.Model):
         self.image_generator = genart.ImageGenerator(32, 32)
         
         self.agent_adoption_counts = np.zeros(number_agents)
+        
+        self.novelty_calculated = False
+        
+        self.bottom_1_percentile_novelty = 0
+        self.top_99_percentile_novelty = 1
 
         # Thresholds
         self.self_threshold = None  # When to share
@@ -557,12 +562,14 @@ class Model(mesa.Model):
         # Add the new novelty value to the tracked list
         self.novelty_values.append(novelty)
 
-        # Calculate the 1st and 99th percentiles for bounds
-        bottom_1_percentile = np.percentile(self.novelty_values, 1)
-        top_99_percentile = np.percentile(self.novelty_values, 99)
+        # Calculate the 1st and 99th percentiles for bounds once every 5 steps
+        if self.schedule.time % 5 == 0 or len(self.novelty_values) < 100 and self.schedule.time < 100 and self.novelty_calculated == False:
+            self.novelty_calculated = True
+            self.bottom_1_percentile_novelty = np.percentile(self.novelty_values, 1)
+            self.top_99_percentile_novelty = np.percentile(self.novelty_values, 99)
 
         # Normalize the input novelty value using these bounds
-        normalized_novelty = (novelty - bottom_1_percentile) / (top_99_percentile - bottom_1_percentile + 1e-8)
+        normalized_novelty = (novelty - self.bottom_1_percentile_novelty) / (self.top_99_percentile_novelty - self.bottom_1_percentile_novelty + 1e-8)
 
         # Clip to ensure the value is between 0 and 1
         normalized_novelty = np.clip(normalized_novelty, 0, 1)
@@ -604,6 +611,8 @@ class Model(mesa.Model):
         # First process all inboxes in batch
         self.process_inboxes_parallel()
         self.calculate_novelty_threshold()
+        
+        self.novelty_calculated = False
         
         if self.schedule.time % 1 == 0:
             # Log overall network density

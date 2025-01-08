@@ -12,6 +12,7 @@ class kNN:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.feature_vectors = torch.tensor([], device=self.device)
         self.k = 3  # Default initial k value
+        self.last_update_step = -1
         
         print(f"Initialized kNN for agent {agent_id}")
         
@@ -484,9 +485,11 @@ class kNN:
             if random.random() > 0.75:
                 # Recalculate optimal k if we have enough vectors every 3 steps
                 if step % 3 == 0 and self.feature_vectors.shape[0] >= 3:
-                    if self.feature_vectors.shape[0] >= 3:  # Need at least 3 points for elbow method
-                        self.k = self.calculate_k_elbow()
-                        #print(f"Recalculated optimal k = {self.k}")
+                    if not self.last_update_step == step:
+                        self.last_update_step = step
+                        if self.feature_vectors.shape[0] >= 3:  # Need at least 3 points for elbow method
+                            self.k = self.calculate_k_elbow()
+                            #print(f"Recalculated optimal k = {self.k}")
             
         except Exception as e:
             print(f"Error adding feature vectors: {e}")
