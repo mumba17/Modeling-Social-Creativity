@@ -1,5 +1,6 @@
 import numpy as np
 from scipy.special import erf
+from timing_utils import time_it
 
 class WundtCurve:
     def __init__(self, reward_mean=0.3, reward_std=0.1, 
@@ -16,6 +17,7 @@ class WundtCurve:
         self.punish_std = punish_std
         self.alpha = alpha
 
+    @time_it
     def cumulative_gaussian(self, x, mean, std):
         """
         Compute cumulative Gaussian as defined in paper (equation 3)
@@ -31,6 +33,7 @@ class WundtCurve:
         """Compute punishment component P(x)"""
         return self.cumulative_gaussian(x, self.punish_mean, self.punish_std)
 
+    @time_it
     def hedonic_value(self, x):
         """
         Compute hedonic value H(x) = R(x) - αP(x)
@@ -55,3 +58,7 @@ class WundtCurve:
         x = np.linspace(0, 1, 1000)
         h = [self.hedonic_value(xi) for xi in x]
         return x[np.argmax(h)]
+    
+    def plot_curve(self):
+        """ Plot the Wundt curve, showing what novelty value generates interest"""
+        

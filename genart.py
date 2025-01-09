@@ -11,6 +11,7 @@ from datetime import datetime
 import json
 import torch
 import time
+from timing_utils import time_it
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -493,7 +494,8 @@ class ExpressionNode:
         self.right = right
         self.value: Optional[QuaternionTensor] = None
         self.constant = False
-        
+    
+    @time_it
     def evaluate(self, coords: QuaternionTensor) -> QuaternionTensor:
         try:
             #print(f"Evaluating: Operator={self.operator}, OpType={self.op_type}")
@@ -736,6 +738,7 @@ class ImageGenerator:
         self.coords = QuaternionTensor(coords)
 
     @torch.no_grad()
+    @time_it
     def generate(self, expression: ExpressionNode) -> Image.Image:
         try:
             result = expression.evaluate(self.coords)

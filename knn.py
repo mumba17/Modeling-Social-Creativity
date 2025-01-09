@@ -1,6 +1,8 @@
 import torch
 import numpy as np
 import random
+from timing_utils import time_it
+
 
 class kNN:
     def __init__(self, agent_id=None):
@@ -8,76 +10,89 @@ class kNN:
         Initialize the kNN instance with GPU support.
         Uses elbow method to automatically determine optimal k value.
         """
-        self.agent_id = agent_id
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.feature_vectors = torch.tensor([], device=self.device)
+        self.agent_id = agent_id # Unique identifier for this agent
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu") # Use GPU if available
+        self.feature_vectors = torch.tensor([], device=self.device) # Initialize empty tensor
         self.k = 3  # Default initial k value
-        self.last_update_step = -1
+        self.last_update_step = -1  # Last step when k was updated
+        self.random_gen = random.Random(agent_id) # Initialize random generator with agent_id as seed
+        self.random_threshold = self.random_gen.random() # Generate initial random threshold
         
         print(f"Initialized kNN for agent {agent_id}")
-        
-    def get_max_k(self, n_samples, feature_dim=64):
+    @time_it
+    def get_max_k(self, n_samples, n_features):
         """
-        Calculate maximum reasonable k value based on dataset size and dimensionality.
+        Determine maximum k value based on dataset characteristics.
         
         Args:
-            n_samples: Number of data points
-            feature_dim: Dimensionality of feature vectors
-        
+            n_samples (int): Number of data points
+            n_features (int): Number of features per data point
+            
         Returns:
-            int: Maximum reasonable k value
+            int: Maximum k value
         """
-        # Statistical rules of thumb:
-        # 1. k ≈ sqrt(n) for basic estimation
-        # 2. k should be less than n/10 to avoid oversmoothing
-        # 3. k should account for dimensionality
+        # Rule of thumb: k should not exceed sqrt(n/2)
+        theoretical_max = int(np.sqrt(n_samples/2))
         
-        sqrt_n = int(torch.sqrt(torch.tensor(n_samples)).item())
-        dim_factor = int(torch.log2(torch.tensor(feature_dim)).item())
-        
-        # Balance between sqrt(n) and dimensionality considerations
-        max_k = min(
-            sqrt_n * dim_factor,  # Scale with both size and dimensionality
-            n_samples // 10,      # Upper bound to prevent oversmoothing
-            500                   # Hard upper limit for computational efficiency
+        # Cap k based on dataset size and dimensionality
+        absolute_max = min(
+            theoretical_max,
+            n_samples - 1,  # k can't be larger than n-1
+            100  # Hard upper limit for computational efficiency
         )
         
-        return max(max_k, 3)  # Ensure minimum k of 3
-
+        return max(3, absolute_max)  # Ensure minimum k is 3
+    @time_it
     def generate_k_values(self, max_k):
         """
-        Generate a reasonable progression of k values to test.
+        Generate a sequence of k values for testing.
+        Uses logarithmic spacing for larger ranges to reduce computation.
         
         Args:
-            max_k: Maximum k value to consider
-        
+            max_k (int): Maximum k value to consider
+            
         Returns:
-            list: Sorted list of k values to test
+            list: List of k values to test
         """
-        k_values = []
+        if max_k <= 3:
+            return [3]
+            
+        if max_k <= 10:
+            # For small ranges, use all values
+            return list(range(3, max_k + 1))
         
-        if max_k < 3:
-            return [3]  # Ensure at least the minimum k
+        # For larger ranges, use logarithmic spacing
+        # Always include important boundary values
+        k_values = [3]  # Start with minimum k
         
-        # Start with dense sampling for small k
-        k_values.extend(range(3, min(11, max_k + 1)))
+        if max_k <= 20:
+            # For medium ranges, use step of 2
+            k_values.extend(range(4, max_k + 1, 2))
+        else:
+            # For large ranges, use logarithmic spacing
+            # Generate ~15 points between 3 and max_k
+            log_space = np.logspace(
+                np.log10(3),
+                np.log10(max_k),
+                min(15, max_k - 3)
+            ).astype(int)
+            
+            # Remove duplicates and sort
+            k_values.extend(range(3, 12, 2))
+            k_values = sorted(set(k_values + list(log_space)))
+            
+            # Ensure the sequence is reasonable
+            if len(k_values) < 5:  # If too few points
+                # Fall back to linear spacing with reasonable step
+                step = max(2, (max_k - 3) // 10)
+                k_values = list(range(3, max_k + 1, step))
         
-        if max_k > 10:
-            # Add values with increasing steps
-            k = 12
-            while k <= max_k:
-                if k <= 30:
-                    k_values.append(k)
-                    k += 2  # Step by 2 up to 30
-                elif k <= 100:
-                    k_values.append(k)
-                    k += 10  # Step by 10 up to 100
-                else:
-                    k_values.append(k)
-                    k += 25  # Step by 25 beyond 100
-                    
-        return sorted(list(set(k_values)))  # Remove any duplicates
-
+        # Always include max_k if it's not already included
+        if k_values[-1] != max_k:
+            k_values.append(max_k)
+        
+        return k_values
+    @time_it
     def calculate_k_elbow(self):
         """
         Implement the elbow method to find optimal k value.
@@ -186,7 +201,7 @@ class kNN:
             if "out of memory" in str(e):
                 torch.cuda.empty_cache()
                 raise
-                
+    @time_it             
     def find_nearest_neighbors(self, query_vector, batch_size=1000):
         """
         Find the indices of the k nearest neighbors for a given query vector.
@@ -231,7 +246,7 @@ class kNN:
             if "out of memory" in str(e):
                 torch.cuda.empty_cache()
                 raise
-            
+    @time_it
     def get_distances(self, batch_size=1000):
         """Calculate all pairwise distances in parallel using batched matrix operations"""
         try:
@@ -314,7 +329,7 @@ class kNN:
         except Exception as e:
             print(f"Error in aggregate_distances: {e}")
             return {0: 0.0}
-        
+    @time_it
     def get_novelty(self, query_vector):
         """
         Calculate novelty score as average distance to k nearest neighbors.
@@ -363,7 +378,7 @@ class kNN:
             print(f"Query vector shape: {query_vector.shape}")
             print(f"Feature vectors shape: {self.feature_vectors.shape}")
             return 0.0
-        
+    @time_it        
     def batch_get_novelty(self, query_vectors):
         """
         Calculate novelty scores for multiple query vectors at once.
@@ -410,7 +425,7 @@ class kNN:
             print(f"Query vectors shape: {query_vectors.shape}")
             print(f"Feature vectors shape: {self.feature_vectors.shape}")
             return torch.zeros(query_vectors.shape[0], device=self.device)
-        
+    @time_it        
     def batch_get_novelty_stream(self, query_vectors, stream):
         """
         Stream-aware version of batch_get_novelty that works with CUDA streams
@@ -457,7 +472,7 @@ class kNN:
             print(f"Query vectors shape: {query_vectors.shape}")
             print(f"Feature vectors shape: {self.feature_vectors.shape}")
             return torch.zeros(query_vectors.shape[0], device=self.device)
-
+    @time_it
     def add_feature_vectors(self, new_feature_vectors, step=0):
         """
         Add new feature vectors and recalculate optimal k using elbow method
@@ -481,8 +496,11 @@ class kNN:
             else:
                 self.feature_vectors = torch.cat((self.feature_vectors, new_feature_vectors), dim=0)
             
+            # Generate new random threshold between 0 and 1
+            self.random_threshold = self.random_gen.random()
+        
             #Random chance of 75% of not updating k
-            if random.random() > 0.75:
+            if self.random_threshold > 0.75:
                 # Recalculate optimal k if we have enough vectors every 3 steps
                 if step % 3 == 0 and self.feature_vectors.shape[0] >= 3:
                     if not self.last_update_step == step:
@@ -490,6 +508,8 @@ class kNN:
                         if self.feature_vectors.shape[0] >= 3:  # Need at least 3 points for elbow method
                             self.k = self.calculate_k_elbow()
                             #print(f"Recalculated optimal k = {self.k}")
+            else:
+                self.random = random.Random()
             
         except Exception as e:
             print(f"Error adding feature vectors: {e}")

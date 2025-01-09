@@ -3,6 +3,7 @@ import torch.nn as nn
 import torchvision.models as models
 import torchvision
 from PIL import Image
+from timing_utils import time_it
 
 class FeatureExtractor(nn.Module):
     def __init__(self, output_dims=64):
@@ -61,13 +62,15 @@ class FeatureExtractor(nn.Module):
         
         # Move model to appropriate device
         self.to(self.device)
-
+    
+    @time_it
     def standardize_features(self, features):
         """Standardize features using z-score normalization"""
         mean = features.mean(dim=1, keepdim=True)
         std = features.std(dim=1, keepdim=True) + 1e-8  # Add small epsilon to avoid division by zero
         return (features - mean) / std
-            
+    
+    @time_it
     def forward(self, x):
         # Ensure input is on correct device
         x = x.to(self.device)
@@ -90,8 +93,9 @@ class FeatureExtractor(nn.Module):
         features = torch.nn.functional.normalize(features, p=2, dim=1)
         
         return features
-
+    
     @torch.no_grad()
+    @time_it
     def extract_features(self, x):
         self.eval()
         
