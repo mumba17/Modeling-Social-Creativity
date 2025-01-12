@@ -17,6 +17,7 @@ from PIL import Image
 from wundtcurve import WundtCurve
 from timing_utils import time_it, TimingStats
 from image_saver import ImageSaver
+from network_tracker import NetworkTracker
 
 log_dir = f"logs/run_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_v1"
 
@@ -64,7 +65,7 @@ class Agent(mesa.Agent):
         
         # Communication
         self.inbox = []
-        
+
     @time_it
     def hedonic_evaluation(self, novelty):
         """
@@ -87,11 +88,11 @@ class Agent(mesa.Agent):
             # Update running average with type checking
             if not hasattr(self, 'average_interest'):
                 self.average_interest = 0.0
-                
+
             self.average_interest = float(self.alpha * self.average_interest + (1 - self.alpha) * hedonic_value)
-            
+
             return hedonic_value
-            
+
         except Exception as e:
             print(f"Error in hedonic evaluation for agent {self.unique_id}: {e}")
             return 0.0  # Safe fallback
@@ -244,6 +245,7 @@ class Model(mesa.Model):
         
         # Create dedicated logging directories
         self.log_base = log_dir
+        self.network_tracker = NetworkTracker(number_agents, self.log_base)
         self.image_dir = f"{log_dir}/images"
         os.makedirs(self.image_dir, exist_ok=True)
         
@@ -264,24 +266,21 @@ class Model(mesa.Model):
         self.agent_success_rates = np.zeros(number_agents)
         
     def update_connection_strength(self, sender_id, receiver_id, success=True, timestamp=None):
-        """Update connection strength with proper temporal tracking"""
+        """Update network tracker with new interaction"""
         if timestamp is None:
             timestamp = self.schedule.time
             
-        # Update raw interaction count
-        self.connection_matrix[sender_id][receiver_id] += 1
+        self.network_tracker.record_interaction(
+            sender_id=sender_id,
+            receiver_id=receiver_id,
+            accepted=success,
+            timestamp=timestamp
+        )
         
-        if success:
-            # Track successful interactions
-            self.successful_interactions[sender_id][receiver_id] += 1
-            # Update timestamp of last successful interaction
-            self.interaction_timestamps[sender_id][receiver_id] = timestamp
-            
-            # Log success rate
-            total_attempts = self.connection_matrix[sender_id][receiver_id]
-            success_rate = self.successful_interactions[sender_id][receiver_id] / total_attempts
-            self.writer.add_scalar(f'connections/success_rate_{sender_id}_{receiver_id}', 
-                             success_rate, timestamp)
+        # Log network metrics
+        metrics = self.network_tracker.get_network_metrics()
+        for metric_name, value in metrics.items():
+            self.writer.add_scalar(f'network/{metric_name}', value, timestamp)
     @time_it   
     def calculate_novelty_threshold(self):
         """Calculate thresholds based on interest distributions from all agents in current step"""
@@ -405,7 +404,7 @@ class Model(mesa.Model):
     
     @time_it
     def process_inboxes_parallel(self):
-        """Optimized parallel inbox processing using batch operations and memory pinning"""
+        """Optimized parallel inbox processing with network tracking"""
         if not torch.cuda.is_available():
             self.process_inboxes_batch()
             return
@@ -466,35 +465,40 @@ class Model(mesa.Model):
                 scores = novelty_scores[agent_idx]
                 relevant_messages = [msg for idx, msg in all_messages if idx == agent_idx]
                 
-                # Pre-allocate features for addition
-                features_to_add = []
-                domain_entries = []
-                
                 for msg, novelty in zip(relevant_messages, scores):
                     novelty_score = self.normalise_novelty(novelty.item())
                     interest = agent.hedonic_evaluation(novelty_score)
                     
-                    if interest > self.domain_threshold:
-                        features_to_add.append(msg['artifact']['features'])
-                        domain_entries.append({
+                    # Record the interaction in network tracker
+                    accepted = interest > self.domain_threshold
+                    self.update_connection_strength(
+                        sender_id=msg['sender_id'],
+                        receiver_id=agent_idx,
+                        success=accepted,
+                        timestamp=self.schedule.time
+                    )
+                    
+                    if accepted:
+                        # Add to agent's memory and domain if accepted
+                        features = msg['artifact']['features']
+                        if len(features.shape) == 1:
+                            features = features.unsqueeze(0)
+                        elif len(features.shape) == 3:
+                            features = features.squeeze(1)
+                            
+                        agent.knn.add_feature_vectors(features, self.schedule.time)
+                        
+                        domain_entry = {
                             'artifact': msg['artifact'],
                             'creator_id': msg['sender_id'],
                             'evaluator_id': agent_idx,
                             'novelty': novelty.item(),
                             'interest': interest,
                             'timestamp': self.schedule.time
-                        })
+                        }
+                        self.add_to_domain(domain_entry)
                     
                     agent.average_interest_other.append(interest)
-                
-                # Batch add features
-                if features_to_add:
-                    features_tensor = torch.stack(features_to_add)
-                    agent.knn.add_feature_vectors(features_tensor, self.schedule.time)
-                    
-                    # Batch add to domain
-                    for entry in domain_entries:
-                        self.add_to_domain(entry)
                 
                 agent.inbox = []  # Clear processed inbox
 
@@ -600,19 +604,19 @@ class Model(mesa.Model):
             # Synchronize all streams
             torch.cuda.synchronize()
             #print("All CUDA streams synchronized")
-            
+
             # Assign results back to agents
             for agent, result in zip(agents, results):
                 agent.generated_image = result['image']
                 agent.generated_expression = result['expression'].to_string()
-                
+
                 # Add to personal experience/memory
                 features = result['features']
                 if len(features.shape) == 1:
                     features = features.unsqueeze(0)
                 elif len(features.shape) == 3:
                     features = features.squeeze(1)
-                    
+
                 agent.knn.add_feature_vectors(features, self.schedule.time)
                 agent.artifact_memory.append(result)
                 
@@ -640,7 +644,7 @@ class Model(mesa.Model):
                         for _ in range(self.amount_shares):
                             recipient = random.choice(other_agents)
                             recipient.inbox.append(message)
-                        
+
         except Exception as e:
             print(f"Error in parallel generation: {e}")
             torch.cuda.empty_cache()  # Clear GPU memory
@@ -654,7 +658,7 @@ class Model(mesa.Model):
                     fallback = agent.generate_artifact()
                     agent.generated_image = fallback['image']
                     agent.generated_expression = fallback['expression'].to_string()
-            
+
     @time_it
     def update_novelty_bounds(self):
         """Update the percentile bounds using a rolling window of novelty values"""
@@ -721,33 +725,45 @@ class Model(mesa.Model):
         self.novelty_calculated = False
         
         if self.schedule.time % 1 == 0:
-            # Log overall network density
-            connections = np.count_nonzero(self.connection_matrix)
-            total_possible = self.num_agents * (self.num_agents - 1)
-            network_density = connections / total_possible
-            self.writer.add_scalar('network/density', network_density, self.schedule.time)
+            # Log network metrics
+            metrics = self.network_tracker.get_network_metrics()
+            for metric_name, value in metrics.items():
+                self.writer.add_scalar(f'network/{metric_name}', value, self.schedule.time)
+                
+            # Log per-agent network stats
+            for agent_id in range(self.num_agents):
+                stats = self.network_tracker.get_agent_stats(agent_id)
+                for stat_name, value in stats.items():
+                    self.writer.add_scalar(f'agents/{agent_id}/network/{stat_name}', 
+                                        value, self.schedule.time)
             
-            # Log top contributing agents
-            top_contributors = np.argsort(self.domain_contributions)[-5:][::-1]
-            for rank, agent_id in enumerate(top_contributors):
-                self.writer.add_scalar(f'top_contributors/rank_{rank}', 
-                                    agent_id,
-                                    self.schedule.time)
-                self.writer.add_scalar(f'top_contributors/score_{rank}', 
-                                    self.domain_contributions[agent_id],
-                                    self.schedule.time)
-            
-            # Log overall connection strengths
-            self.writer.add_scalar('network/total_connections', 
-                                np.sum(self.connection_matrix),
-                                self.schedule.time)
-            self.writer.add_scalar('network/average_strength',
-                                np.mean(self.connection_matrix[self.connection_matrix > 0]),
-                                self.schedule.time)
+            # Save network snapshot every 100 steps
+            if self.schedule.time % 100 == 0:
+                self.network_tracker.save_snapshot(self.schedule.time)
+                
+            # Print validation stats every 50 steps
+            if self.schedule.time % 50 == 0:
+                
+                # Print top communicating pairs
+                comm_matrix = self.network_tracker.communication_matrix
+                top_pairs = []
+                for i in range(self.num_agents):
+                    for j in range(i+1, self.num_agents):
+                        total_comms = comm_matrix[i,j] + comm_matrix[j,i]
+                        if total_comms > 0:
+                            top_pairs.append((i, j, total_comms))
+                
+                top_pairs.sort(key=lambda x: x[2], reverse=True)
+                
+                print("\nTop 5 Communicating Pairs:")
+                for i, j, comms in top_pairs[:5]:
+                    accepts = (self.network_tracker.acceptance_matrix[i,j] + 
+                            self.network_tracker.acceptance_matrix[j,i])
+                    print(f"Agents {i}-{j}: {comms} communications, {accepts} acceptances")
 
         self.schedule.step()
-            
-def run_simulation(num_agents=1000, steps=5000):
+    
+def run_simulation(num_agents=40, steps=5000):
     """Run simulation with proper cleanup"""
     print(f"\nStarting simulation with {num_agents} agents for {steps} steps")
     model = Model(num_agents)
