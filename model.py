@@ -36,7 +36,7 @@ class Agent(mesa.Agent):
         
         
         # Generation parameters
-        self.gen_depth = np.random.randint(4, 10)
+        self.gen_depth = np.random.randint(4, 8)
         self.current_expression = None
         self.artifact_memory = []
         
@@ -196,11 +196,16 @@ class Agent(mesa.Agent):
 
 
 class Model(mesa.Model):
-    def __init__(self, number_agents=100):
+    def __init__(self, 
+             number_agents=100, 
+             output_dims=64,
+             log_dir=None):
         super().__init__()
+        
+        self.output_dims = output_dims
         self.num_agents = number_agents
         self.schedule = mesa.time.RandomActivation(self)
-        self.feature_extractor = FeatureExtractor(output_dims=64)
+        self.feature_extractor = FeatureExtractor(output_dims=self.output_dims)
         self.image_generator = genart.ImageGenerator(32, 32)
         
         self.agent_adoption_counts = np.zeros(number_agents)
@@ -230,8 +235,10 @@ class Model(mesa.Model):
         
         self.image_saver = ImageSaver()
         
+        self.log_dir = log_dir
+        
         # Logging
-        self.writer = SummaryWriter(log_dir=log_dir)
+        self.writer = SummaryWriter(log_dir=self.log_dir)
         self.log_groups = {
             'agents': {},
             'domain': {},
@@ -244,15 +251,15 @@ class Model(mesa.Model):
         self.running = True
         
         # Create dedicated logging directories
-        self.log_base = log_dir
+        self.log_base = self.log_dir
         self.network_tracker = NetworkTracker(number_agents, self.log_base)
-        self.image_dir = f"{log_dir}/images"
+        self.image_dir = f"{self.log_dir}/images"
         os.makedirs(self.image_dir, exist_ok=True)
         
         # Create agent-specific writers
         self.agent_writers = {}
         for i in range(number_agents):
-            agent_dir = f"{log_dir}/agent_{i}"
+            agent_dir = f"{self.log_dir}/agent_{i}"
             os.makedirs(agent_dir, exist_ok=True)
             self.agent_writers[i] = SummaryWriter(log_dir=agent_dir)
             
@@ -277,10 +284,6 @@ class Model(mesa.Model):
             timestamp=timestamp
         )
         
-        # Log network metrics
-        metrics = self.network_tracker.get_network_metrics()
-        for metric_name, value in metrics.items():
-            self.writer.add_scalar(f'network/{metric_name}', value, timestamp)
     @time_it   
     def calculate_novelty_threshold(self):
         """Calculate thresholds based on interest distributions from all agents in current step"""
@@ -510,16 +513,13 @@ class Model(mesa.Model):
     
     @time_it
     def process_generations_parallel(self):
-        """Batch process art generation using CUDA streams with proper type handling"""
+        """Batch process art generation using CUDA streams with proper type handling and optimized batching for RTX 3090"""
         if not torch.cuda.is_available():
             return
                 
         # Create lists for batch processing
         expressions = []
         agents = []
-        
-        # Debug logging
-        #print(f"Initial device check - CUDA available: {torch.cuda.is_available()}")
         
         # Collect all expressions that need to be generated
         for agent in self.schedule.agents:
@@ -536,29 +536,32 @@ class Model(mesa.Model):
             agents.append(agent)
         
         try:
+            # Configure optimal batch size for RTX 3090
+            OPTIMAL_BATCH_SIZE = 250
+            NUM_STREAMS = 4
 
-            # Create multiple CUDA streams for pipeline parallelism
-            num_streams = min(4, torch.cuda.device_count())
-            streams = [torch.cuda.Stream() for _ in range(num_streams)]
-            #print(f"Created {num_streams} CUDA streams")
+            # Create CUDA streams for pipeline parallelism
+            streams = [torch.cuda.Stream() for _ in range(NUM_STREAMS)]
             
-            # Split into batches
-            batch_size = max(1, len(expressions) // num_streams)
-            batches = [expressions[i:i + batch_size] for i in range(0, len(expressions), batch_size)]
-            agent_batches = [agents[i:i + batch_size] for i in range(0, len(agents), batch_size)]
+            # Split into optimal sized batches
+            batches = [expressions[i:i + OPTIMAL_BATCH_SIZE] 
+                    for i in range(0, len(expressions), OPTIMAL_BATCH_SIZE)]
+            agent_batches = [agents[i:i + OPTIMAL_BATCH_SIZE] 
+                            for i in range(0, len(agents), OPTIMAL_BATCH_SIZE)]
             
             results = []
             
-            # Process each batch in parallel streams
-            for stream_idx, (expr_batch, agent_batch) in enumerate(zip(batches, agent_batches)):
-                #print(f"Processing batch {stream_idx + 1}/{len(batches)}")
+            # Process batches using stream cycling
+            for batch_idx, (expr_batch, agent_batch) in enumerate(zip(batches, agent_batches)):
+                stream_idx = batch_idx % NUM_STREAMS
                 with torch.cuda.stream(streams[stream_idx]):
+                    # Monitor memory usage
+                    if torch.cuda.memory_allocated() > 0.9 * torch.cuda.get_device_properties(0).total_memory:
+                        torch.cuda.empty_cache()
+                    
                     # Step 1: Generate coordinates batch
                     coords_batch = self.image_generator.coords.data.expand(len(expr_batch), -1, -1, -1)
                     coords_batch = coords_batch.to(dtype=torch.float32, device='cuda')
-                    
-                    # Debug coords batch
-                    #print(f"Coords batch - shape: {coords_batch.shape}, dtype: {coords_batch.dtype}")
                     
                     # Step 2: Evaluate expressions in batch
                     evaluated_batch = []
@@ -568,7 +571,6 @@ class Model(mesa.Model):
                         evaluated_batch.append(result.data)
                     
                     evaluated_tensor = torch.stack(evaluated_batch).to(dtype=torch.float32)
-                    #print(f"Evaluated tensor - shape: {evaluated_tensor.shape}, dtype: {evaluated_tensor.dtype}")
                     
                     # Step 3: Convert to RGB in batch with explicit type casting
                     rgb_batch = []
@@ -578,7 +580,6 @@ class Model(mesa.Model):
                         rgb_batch.append(rgb)
                     
                     rgb_tensor = torch.stack(rgb_batch)
-                    #print(f"RGB tensor - shape: {rgb_tensor.shape}, dtype: {rgb_tensor.dtype}")
                     
                     # Step 4: Convert to float32 for feature extraction
                     rgb_float = rgb_tensor.to(dtype=torch.float32) / 255.0  # Normalize to [0,1]
@@ -586,7 +587,6 @@ class Model(mesa.Model):
                     
                     # Step 5: Extract features
                     features_batch = self.feature_extractor(rgb_float)
-                    #print(f"Features batch - shape: {features_batch.shape}, dtype: {features_batch.dtype}")
                     
                     # Step 6: Create PIL images (CPU operation, do last)
                     images = [Image.fromarray(rgb.cpu().numpy()) for rgb in rgb_tensor]
@@ -603,7 +603,6 @@ class Model(mesa.Model):
             
             # Synchronize all streams
             torch.cuda.synchronize()
-            #print("All CUDA streams synchronized")
 
             # Assign results back to agents
             for agent, result in zip(agents, results):
@@ -648,11 +647,7 @@ class Model(mesa.Model):
         except Exception as e:
             print(f"Error in parallel generation: {e}")
             torch.cuda.empty_cache()  # Clear GPU memory
-            # Print CUDA memory stats
-            #if torch.cuda.is_available():
-                #print(f"CUDA memory allocated: {torch.cuda.memory_allocated()/1e9:.2f} GB")
-                #print(f"CUDA memory cached: {torch.cuda.memory_reserved()/1e9:.2f} GB")
-            # Provide fallback generation if needed
+            # Fallback generation if needed
             for agent in agents:
                 if not hasattr(agent, 'generated_image'):
                     fallback = agent.generate_artifact()
@@ -763,24 +758,129 @@ class Model(mesa.Model):
 
         self.schedule.step()
     
-def run_simulation(num_agents=40, steps=5000):
-    """Run simulation with proper cleanup"""
-    print(f"\nStarting simulation with {num_agents} agents for {steps} steps")
-    model = Model(num_agents)
-    
-    with tqdm(total=steps, desc="Simulation Progress") as pbar:
-        for step in range(steps):
-            print(f"\nStep {step+1}/{steps}")
-            TimingStats().reset_step()
-            model.step()
-            TimingStats().print_step_report()
-            pbar.update(1)
-    # Proper cleanup of all writers
-    model.writer.close()
-    for writer in model.agent_writers.values():
-        writer.close()
-    
-    print("\nSimulation completed!")
-        
+def run_experiments(base_log_dir="experiments"):
+    """
+    Run a series of experiments with different parameter configurations.
+    Parameters match the Model class exactly.
+    """
+    import os
+    import datetime
+    import itertools
+    import json
+    from tqdm import tqdm
+    from torch.utils.tensorboard import SummaryWriter
+
+    # Normalize and validate the base log directory
+    base_log_dir = os.path.abspath(os.path.normpath(base_log_dir))
+    print(f"Normalized base log directory: {base_log_dir}")  # Debugging
+
+    if not os.path.exists(base_log_dir):
+        print(f"Base log directory does not exist. Creating: {base_log_dir}")
+        os.makedirs(base_log_dir, exist_ok=True)
+
+    # Define parameter ranges for experiments
+    population_sizes = [500]
+    output_dims = [64]  # ResNet feature dimensions
+
+    # Create sharing configurations for each population size
+    sharing_configs = []
+    for pop_size in population_sizes:
+        shares = [2, 8, 32]
+        broadcast_share = pop_size - 1
+        if broadcast_share not in shares and broadcast_share > 32:
+            shares.append(broadcast_share)
+        sharing_configs.append((pop_size, shares))
+
+    steps = 5000  # Simulation steps
+
+    # Create base experiment directory with timestamp
+    timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    base_dir = os.path.join(base_log_dir, f"batch_{timestamp}")
+    print(f"Creating base directory: {base_dir}")  # Debugging
+    os.makedirs(base_dir, exist_ok=True)
+
+    # Generate all parameter combinations
+    experiment_configs = []
+    for pop_size, share_ranges in sharing_configs:
+        for dims, shares in itertools.product(output_dims, share_ranges):
+            config = {
+                'number_agents': pop_size,
+                'output_dims': dims,
+                'amount_shares': shares,
+                'steps': steps
+            }
+            experiment_configs.append(config)
+
+    # Save experiment metadata
+    metadata = {
+        'timestamp': timestamp,
+        'total_experiments': len(experiment_configs),
+        'parameter_ranges': {
+            'population_sizes': population_sizes,
+            'output_dims': output_dims,
+            'steps': steps,
+            'sharing_configurations': {
+                str(pop): shares for pop, shares in sharing_configs
+            }
+        }
+    }
+    metadata_path = os.path.join(base_dir, "experiment_metadata.json")
+    print(f"Saving metadata to: {metadata_path}")  # Debugging
+    with open(metadata_path, 'w') as f:
+        json.dump(metadata, f, indent=2)
+
+    # Run experiments
+    for config in tqdm(experiment_configs, desc="Running Experiments"):
+        share_type = 'broadcast' if config['amount_shares'] == config['number_agents'] - 1 else str(config['amount_shares'])
+        log_dir = os.path.join(
+            base_dir,
+            f"pop{config['number_agents']}_dims{config['output_dims']}_share{share_type}"
+        )
+        print(f"Creating log directory for experiment: {log_dir}")  # Debugging
+        os.makedirs(log_dir, exist_ok=True)
+
+        # Initialize the model with the configuration
+        model = Model(
+            number_agents=config['number_agents'],
+            output_dims=config['output_dims'],
+            log_dir=log_dir
+        )
+        model.amount_shares = config['amount_shares']
+        model.log_base = log_dir
+        model.writer = SummaryWriter(log_dir=log_dir)
+
+        # Debugging: Ensure writer log_dir is correct
+        print(f"SummaryWriter log directory: {log_dir}")
+
+        # Create agent-specific writers
+        model.agent_writers = {}
+        for i in range(config['number_agents']):
+            agent_dir = os.path.join(log_dir, f"agent_{i}")
+            os.makedirs(agent_dir, exist_ok=True)
+            model.agent_writers[i] = SummaryWriter(log_dir=agent_dir)
+            print(f"Agent {i} log directory: {agent_dir}")  # Debugging
+
+        # Run the simulation
+        with tqdm(total=config['steps'], desc=f"Simulation Progress") as pbar:
+            for step in range(config['steps']):
+                TimingStats().reset_step()
+                model.step()
+                TimingStats().print_step_report()
+                pbar.update(1)
+
+        # Close writers
+        model.writer.close()
+        for writer in model.agent_writers.values():
+            writer.close()
+
+        # Save experiment configuration
+        config_path = os.path.join(log_dir, "config.json")
+        print(f"Saving configuration to: {config_path}")  # Debugging
+        with open(config_path, 'w') as f:
+            json.dump(config, f, indent=2)
+
+    print(f"\nAll experiments completed! Results saved in {base_dir}")
+
 if __name__ == "__main__":
-    run_simulation()
+    # Run experiments
+    run_experiments()

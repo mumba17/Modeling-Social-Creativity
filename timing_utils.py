@@ -60,7 +60,7 @@ class TimingStats:
         self.current_step_times.clear()
         self.call_counts.clear()  # Critical fix!
 
-ENABLE_TIMING = False
+ENABLE_TIMING = True
 
 def time_it(func):
     """Decorator to measure function execution time"""

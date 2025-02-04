@@ -494,42 +494,58 @@ class ExpressionNode:
         self.right = right
         self.value: Optional[QuaternionTensor] = None
         self.constant = False
-    
+        
     @time_it
     def evaluate(self, coords: QuaternionTensor) -> QuaternionTensor:
         try:
-            #print(f"Evaluating: Operator={self.operator}, OpType={self.op_type}")
-            if self.constant and self.value is not None:
-                result = QuaternionTensor(self.value.data.expand_as(coords.data))
-                #print(f"Constant value shape: {result.data.shape}")
-                return result
+            # Move all computations to GPU at once
+            device = coords.device
 
+            # Pre-allocate result tensor on GPU
+            result = None
+
+            # Handle constant case
+            if self.constant and self.value is not None:
+                return QuaternionTensor(self.value.data.expand_as(coords.data).to(device))
+
+            # Handle base case
             if self.operator is None:
-                #print(f"Return coordinates shape: {coords.data.shape}")
                 return coords
 
+            # Handle coordinate operations
             if self.op_type == 'COORDINATE':
-                result = self.operator(coords.x, coords.y)
+                # Compute coordinate transformation in one GPU operation
+                result = self.operator(coords.x.to(device), coords.y.to(device))
+            
+            # Handle constant operations
             elif self.op_type == 'CONSTANT':
                 if not self.value:
                     self.value = self.operator()
                     self.constant = True
-                result = QuaternionTensor(self.value.data.expand_as(coords.data))
+                result = QuaternionTensor(self.value.data.expand_as(coords.data).to(device))
+            
+            # Handle unary and binary operations
             else:
+                # Evaluate left branch
                 left_val = self.left.evaluate(coords) if self.left else coords
-                #print(f"Left value shape: {left_val.data.shape}; operator=", self.operator)
+                
+                # Unary operations
                 if self.op_type == 'UNARY':
+                    # Execute operation directly on GPU
                     result = self.operator(left_val)
+                
+                # Binary operations
                 else:
+                    # Evaluate right branch
                     right_val = self.right.evaluate(coords) if self.right else coords
-                    #print(f"Right value shape: {right_val.data.shape}; operator=", self.operator)
+                    
+                    # Execute binary operation on GPU
                     result = self.operator(left_val, right_val)
-                    # Ensure consistent shape
+
+            # Ensure shape consistency while keeping data on GPU
             if result.data.shape != coords.data.shape:
-                #print(f"Shape mismatch detected: {result.data.shape} resetting to {coords.data.shape}")
                 result.data = result.data.reshape(coords.data.shape)
 
-            #print(f"Result shape: {result.data.shape}, dtype: {result.data.dtype}")
             return result
 
         except Exception as e:
@@ -770,12 +786,12 @@ def test_pytorch_main():
     folder_name = f"pytorch_images_{timestamp}"
     os.makedirs(folder_name, exist_ok=True)
     
-    image_size = 64
+    image_size = 512
     generator = ImageGenerator(image_size, image_size, device=device)
     
     # Generate multiple images
-    num_images = 1000
-    image_formulas = {}
+    num_images = 20
+    image_formulas = []
     
     print(f"\nGenerating {num_images} images...")
     start_time = time.time()
@@ -786,21 +802,30 @@ def test_pytorch_main():
             torch.cuda.empty_cache()
             
             # Create random expression with reduced depth
-            expr = ExpressionNode.create_random(depth=7)  # Reduced depth
+            expr = ExpressionNode.create_random(depth=32)  # Reduced depth
             formula_str = expr.to_string()
-            image_formulas[f"image_{i}"] = formula_str
-            #print(f"Image {i+1}: {formula_str}")
+            image_formulas.append({"image": f"image_{i}.png", "expression": formula_str})
             
             # Generate and save image
             img = generator.generate(expr)
             image_path = os.path.join(folder_name, f"image_{i}.png")
             img.save(image_path)
             
-            #print(f"Generated image {i+1}/{num_images}")
-            
         except Exception as e:
             logger.error(f"Error generating image: {e}")
             continue
+    
+    # Save expressions to CSV
+    csv_path = os.path.join(folder_name, "expressions.csv")
+    try:
+        import csv
+        with open(csv_path, mode='w', newline='') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=["image", "expression"])
+            writer.writeheader()
+            writer.writerows(image_formulas)
+        print(f"Expression trees saved to {csv_path}")
+    except Exception as e:
+        logger.error(f"Error saving CSV: {e}")
     
     end_time = time.time()
     total_time = end_time - start_time
@@ -811,6 +836,7 @@ def test_pytorch_main():
     print(f"Average time per image: {avg_time:.5f} seconds")
     print(f"\nFiles saved in '{folder_name}':")
     print(f"- {num_images} images (image_0.png to image_{num_images-1}.png)")
+
 
 if __name__ == "__main__":
     test_pytorch_main()

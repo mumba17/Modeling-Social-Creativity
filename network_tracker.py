@@ -1,6 +1,7 @@
 import networkx as nx
 import numpy as np
 import os
+from timing_utils import time_it
 
 class NetworkTracker:
     def __init__(self, num_agents, log_dir):
@@ -21,6 +22,8 @@ class NetworkTracker:
         self.graph = nx.Graph()
         self.graph.add_nodes_from(range(num_agents))
         
+        
+    @time_it
     def record_interaction(self, sender_id, receiver_id, accepted, timestamp):
         """Record an interaction between agents"""
         # Update communication counts
@@ -35,7 +38,8 @@ class NetworkTracker:
                 self.graph.add_edge(sender_id, receiver_id, weight=1)
         else:
             self.rejection_matrix[sender_id][receiver_id] += 1
-        
+    
+    @time_it
     def get_agent_stats(self, agent_id):
         """Get communication statistics for a specific agent"""
         return {
@@ -49,6 +53,7 @@ class NetworkTracker:
                                       (np.sum(self.communication_matrix[:, agent_id]) + 1e-10)
         }
         
+    @time_it 
     def save_snapshot(self, step):
         """Save network state to files"""
         # Save matrices
@@ -58,7 +63,8 @@ class NetworkTracker:
         
         # Save graph structure
         nx.write_gexf(self.graph, f"{self.network_dir}/network_{step}.gexf")
-            
+     
+    @time_it       
     def get_network_metrics(self):
         """Calculate basic network metrics without visualization"""
         if self.graph.number_of_edges() == 0:
