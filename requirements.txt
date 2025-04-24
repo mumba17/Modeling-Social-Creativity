@@ -1,0 +1,21 @@
+# Core simulation & data handling
+numpy==1.26.3
+scipy==1.14.1
+pandas==2.2.3
+networkx==3.4.1
+pillow==10.2.0 # For image processing
+tqdm==4.66.5   # For progress bars
+
+# Agent-Based Modeling
+mesa==2.4.0
+
+# Machine Learning / Deep Learning
+# Ensure these match your system (CPU/CUDA version)
+# See: https://pytorch.org/get-started/locally/
+torch==2.5.1+cu124
+torchvision==0.20.1
+tensorboard>=2.9.0 # For logging and visualization
+
+# Plotting & Analysis (primarily for analysis_results/)
+matplotlib==3.9.2
+seaborn==0.13.2
