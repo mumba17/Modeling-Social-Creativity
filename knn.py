@@ -1,107 +1,138 @@
+import logging
 import torch
 import numpy as np
+import random
+
+from timing_utils import time_it
+import config
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
 
 class kNN:
+    """
+    k-Nearest Neighbors data structure that supports:
+      - Adding feature vectors
+      - Calculating novelty as average distance to k nearest neighbors
+      - Automatic k update via the elbow method
+    """
     def __init__(self, agent_id=None):
         """
-        Initialize the kNN instance with GPU support.
-        Uses elbow method to automatically determine optimal k value.
+        Parameters
+        ----------
+        agent_id : int, optional
+            Identifier for debugging/logging
         """
         self.agent_id = agent_id
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.feature_vectors = torch.tensor([], device=self.device)
-        self.k = 3  # Default initial k value
+        self.k = config.KNN_DEFAULT_K
+        self.last_update_step = -1
+        self.random_gen = random.Random(agent_id)
+        self.random_threshold = self.random_gen.random()
         
-        print(f"Initialized kNN for agent {agent_id}")
+        # Add support for approximate kNN
+        self.use_approx = False
+        if hasattr(config, 'ENABLE_KNN_APPROX'):
+            self.use_approx = config.ENABLE_KNN_APPROX
+            
+        # Index for fast lookups - lazily initialized when needed
+        self._index = None
         
-    def get_max_k(self, n_samples, feature_dim=64):
-        """
-        Calculate maximum reasonable k value based on dataset size and dimensionality.
+        # Cache distances between common feature vectors
+        self._distance_cache = {}
+        self._cache_hits = 0
+        self._cache_misses = 0
         
-        Args:
-            n_samples: Number of data points
-            feature_dim: Dimensionality of feature vectors
-        
-        Returns:
-            int: Maximum reasonable k value
-        """
-        # Statistical rules of thumb:
-        # 1. k ≈ sqrt(n) for basic estimation
-        # 2. k should be less than n/10 to avoid oversmoothing
-        # 3. k should account for dimensionality
-        
-        sqrt_n = int(torch.sqrt(torch.tensor(n_samples)).item())
-        dim_factor = int(torch.log2(torch.tensor(feature_dim)).item())
-        
-        # Balance between sqrt(n) and dimensionality considerations
-        max_k = min(
-            sqrt_n * dim_factor,  # Scale with both size and dimensionality
-            n_samples // 10,      # Upper bound to prevent oversmoothing
-            500                   # Hard upper limit for computational efficiency
-        )
-        
-        return max(max_k, 3)  # Ensure minimum k of 3
+        # Control frequency of k updates
+        self.k_update_frequency = 3
+        if hasattr(config, 'KNN_UPDATE_FREQUENCY'):
+            self.k_update_frequency = config.KNN_UPDATE_FREQUENCY
 
+        logger.debug(f"Initialized kNN for agent {agent_id} with k={self.k}")
+
+    @time_it
+    def get_max_k(self, n_samples, n_features):
+        """
+        Determine maximum feasible k value based on dataset size.
+
+        Parameters
+        ----------
+        n_samples : int
+        n_features : int
+
+        Returns
+        -------
+        int
+            Maximum recommended k
+        """
+        theoretical_max = int(np.sqrt(n_samples/2))
+        absolute_max = min(
+            theoretical_max,
+            n_samples - 1,
+            100
+        )
+        return max(3, absolute_max)
+
+    @time_it
     def generate_k_values(self, max_k):
         """
-        Generate a reasonable progression of k values to test.
-        
-        Args:
-            max_k: Maximum k value to consider
-        
-        Returns:
-            list: Sorted list of k values to test
-        """
-        k_values = []
-        
-        if max_k < 3:
-            return [3]  # Ensure at least the minimum k
-        
-        # Start with dense sampling for small k
-        k_values.extend(range(3, min(11, max_k + 1)))
-        
-        if max_k > 10:
-            # Add values with increasing steps
-            k = 12
-            while k <= max_k:
-                if k <= 30:
-                    k_values.append(k)
-                    k += 2  # Step by 2 up to 30
-                elif k <= 100:
-                    k_values.append(k)
-                    k += 10  # Step by 10 up to 100
-                else:
-                    k_values.append(k)
-                    k += 25  # Step by 25 beyond 100
-                    
-        return sorted(list(set(k_values)))  # Remove any duplicates
+        Generate candidate k values (logarithmic spacing for large k).
 
+        Parameters
+        ----------
+        max_k : int
+
+        Returns
+        -------
+        list
+            Sequence of candidate k values
+        """
+        if max_k <= 3:
+            return [3]
+        if max_k <= 10:
+            return list(range(3, max_k+1))
+
+        k_values = [3]
+        if max_k <= 20:
+            k_values.extend(range(4, max_k + 1, 2))
+        else:
+            log_space = np.logspace(
+                np.log10(3),
+                np.log10(max_k),
+                min(15, max_k - 2)
+            ).astype(int)
+            k_values.extend(range(3, 12, 2))
+            k_values = sorted(set(k_values + list(log_space)))
+            if len(k_values) < 5:
+                step = max(2, (max_k - 3) // 10)
+                k_values = list(range(3, max_k + 1, step))
+
+        if k_values[-1] != max_k:
+            k_values.append(max_k)
+        return k_values
+
+    @time_it
     def calculate_k_elbow(self):
         """
-        Implement the elbow method to find optimal k value.
-        Uses sampling for large datasets and proper k value progression.
-        
-        Returns:
-            int: Optimal k value based on the elbow method
+        Use elbow method to find optimal k by computing "distortion" over sample set.
+
+        Returns
+        -------
+        int
+            Optimal k for this dataset
         """
         try:
             n_samples = self.feature_vectors.shape[0]
-
             if n_samples < 2:
-                return 3  # Default minimum k if not enough vectors
+                return config.KNN_DEFAULT_K
 
-            # Determine maximum k and generate test values
             max_k = self.get_max_k(n_samples, self.feature_vectors.shape[1])
-
             k_values = self.generate_k_values(max_k)
-            #print(f"max_k: {max_k}")  # Debug statement
-            #print(f"k_values: {k_values}")  # Debug statement
+            if not k_values:
+                return config.KNN_DEFAULT_K
 
-            if not k_values:  # Ensure k_values is not empty
-                print("Warning: k_values is empty. Returning default k=3")
-                return 3
-
-            # Sample data if dataset is large
             MAX_SAMPLE_SIZE = 1000
             if n_samples > MAX_SAMPLE_SIZE:
                 indices = torch.randperm(n_samples)[:MAX_SAMPLE_SIZE]
@@ -109,441 +140,424 @@ class kNN:
             else:
                 vectors_sample = self.feature_vectors
 
-            # Initialize tensors for distortions
             distortions = torch.zeros(len(k_values), device=self.device)
-
-            # Normalize sampled vectors once
-            normalized_vectors = vectors_sample / (torch.norm(vectors_sample, dim=1, keepdim=True) + 1e-8)
-
-            # Calculate all pairwise distances once
+            normalized_vectors = vectors_sample / (
+                torch.norm(vectors_sample, dim=1, keepdim=True) + 1e-8
+            )
             similarities = torch.matmul(normalized_vectors, normalized_vectors.T)
             distances = 1 - similarities
+            distances.fill_diagonal_(float('inf'))
 
-            # Calculate distortion for each k
             for idx, k in enumerate(k_values):
-                # Exclude self-similarity by setting diagonal to inf
-                distances_no_self = distances.clone()
-                distances_no_self.fill_diagonal_(float('inf'))
-
-                # Get top k distances for each point
-                top_k_distances, _ = torch.topk(distances_no_self, k, largest=False, dim=1)
-
-                # Calculate average distortion for this k
+                top_k_distances, _ = torch.topk(distances, k, largest=False, dim=1)
                 distortion = torch.mean(top_k_distances).item()
                 distortions[idx] = distortion
-
                 if self.device.type == "cuda":
                     torch.cuda.empty_cache()
 
-            # Calculate the elbow point using the angle method
             coords = torch.stack([torch.tensor(k_values, device=self.device), distortions], dim=1)
+            coords_min = coords.min(0)[0]
+            coords_max = coords.max(0)[0]
+            coords_normalized = (coords - coords_min) / (coords_max - coords_min + 1e-12)
 
-            # Normalize coordinates to [0,1] range for better angle calculation
-            coords_normalized = (coords - coords.min(0)[0]) / (coords.max(0)[0] - coords.min(0)[0])
-
-            # Calculate angles between consecutive segments
             vectors = coords_normalized[1:] - coords_normalized[:-1]
             angles = []
-
             for i in range(len(vectors) - 1):
                 v1 = vectors[i]
                 v2 = vectors[i + 1]
-                cos_angle = torch.dot(v1, v2) / (torch.norm(v1) * torch.norm(v2))
+                cos_angle = torch.dot(v1, v2) / (torch.norm(v1) * torch.norm(v2) + 1e-12)
                 angle = torch.acos(torch.clamp(cos_angle, -1.0, 1.0))
                 angles.append(angle.item())
-
-            # Find the point with maximum angle (elbow point)
-            if not angles:  # Ensure angles is not empty
-                #print("Warning: angles is empty. Returning default k=3")
-                return 3
+            if not angles:
+                return config.KNN_DEFAULT_K
 
             optimal_idx = angles.index(max(angles)) + 1
             optimal_k = k_values[optimal_idx]
-
             return optimal_k
 
         except Exception as e:
-            print(f"Error in calculate_k_elbow: {e}")
-            return 3  # Return default k value on error
+            logger.error(f"Error in calculate_k_elbow: {e}")
+            return config.KNN_DEFAULT_K
 
-            
     def remove_feature_vectors(self, indices):
         """
-        Remove feature vectors from the kNN instance based on their indices.
-        :param indices: The indices of the feature vectors to be removed
+        Remove feature vectors by index from local memory.
         """
         try:
+            if not self.feature_vectors.shape[0]:
+                return
             mask = torch.ones(self.feature_vectors.shape[0], dtype=torch.bool, device=self.device)
             indices = torch.tensor(indices, device=self.device)
             mask[indices] = False
             self.feature_vectors = self.feature_vectors[mask]
             
-            #print(f"Removed features. Memory size: {self.feature_vectors.shape[0]}")
+            # Invalidate the index
+            self._index = None
+            
+            # Clear distance cache when removing vectors
+            self._distance_cache = {}
         except RuntimeError as e:
-            print(f"Error during removal: {e}")
+            logger.error(f"Error during removal: {e}")
             if "out of memory" in str(e):
                 torch.cuda.empty_cache()
                 raise
-                
+
+    def _build_index(self):
+        """
+        Build an index for approximate nearest neighbor search.
+        Only builds if we're using the approximate mode.
+        """
+        if not self.use_approx or self._index is not None:
+            return
+            
+        if self.feature_vectors.shape[0] < 50:
+            # Don't bother with index for small datasets
+            return
+            
+        try:
+            # Import faiss only if we need it
+            import faiss
+            
+            # Move data to CPU for faiss
+            vectors_cpu = self.feature_vectors.cpu().numpy()
+            
+            # Normalize vectors
+            norms = np.linalg.norm(vectors_cpu, axis=1, keepdims=True)
+            normalized_vectors = vectors_cpu / (norms + 1e-8)
+            
+            # Build index
+            d = normalized_vectors.shape[1]
+            index = faiss.IndexFlatIP(d)  # Inner product = cosine similarity for normalized vectors
+            index.add(normalized_vectors)
+            self._index = (index, normalized_vectors)
+            
+        except ImportError:
+            logger.warning("FAISS library not available, falling back to brute force kNN")
+            self.use_approx = False
+        except Exception as e:
+            logger.error(f"Error building index: {e}")
+            self.use_approx = False
+            
+    @time_it
+    def _find_neighbors_approx(self, query_vector, k):
+        """
+        Find nearest neighbors using approximate search.
+        """
+        if self._index is None:
+            self._build_index()
+            
+        if self._index is None:
+            # If index building failed, fall back to brute force
+            return self.find_nearest_neighbors(query_vector, k)
+            
+        try:
+            # Convert query to numpy
+            query_np = query_vector.cpu().numpy().reshape(1, -1)
+            
+            # Normalize query
+            query_norm = query_np / (np.linalg.norm(query_np) + 1e-8)
+            
+            # Search in index
+            index, _ = self._index
+            _, indices = index.search(query_norm, min(k, index.ntotal))
+            
+            return torch.tensor(indices[0], device=self.device)
+            
+        except Exception as e:
+            logger.error(f"Error in approximate search: {e}")
+            return self.find_nearest_neighbors(query_vector, k)
+
+    @time_it
     def find_nearest_neighbors(self, query_vector, batch_size=1000):
         """
-        Find the indices of the k nearest neighbors for a given query vector.
-        Implements batched processing for large feature sets.
-        :param query_vector: The query vector for which to find the nearest neighbors
-        :param batch_size: Size of batches for processing large feature sets
-        :return: The indices of the k nearest neighbors
+        Find indices of k nearest neighbors for query_vector.
         """
-        try:
-            # Ensure query vector is on correct device
-            query_vector = query_vector.to(self.device)
+        # Use approximate search if enabled and index exists
+        if self.use_approx and self.feature_vectors.shape[0] >= 50:
+            return self._find_neighbors_approx(query_vector, self.k)
             
+        # Fall back to brute force method
+        try:
+            query_vector = query_vector.to(self.device)
             if self.feature_vectors.shape[0] <= batch_size:
-                # If feature set is small enough, process all at once
                 distances = torch.cdist(query_vector.unsqueeze(0), self.feature_vectors).squeeze(0)
                 _, indices = torch.topk(distances, min(self.k, len(distances)), largest=False)
-                return indices.cpu()  # Return indices to CPU
+                return indices.cpu()
             else:
-                # For large feature sets, process in batches
                 min_distances = torch.full((self.k,), float('inf'), device=self.device)
                 min_indices = torch.zeros(self.k, dtype=torch.long, device=self.device)
-                
                 for i in range(0, self.feature_vectors.shape[0], batch_size):
                     batch = self.feature_vectors[i:i + batch_size]
                     batch_distances = torch.cdist(query_vector.unsqueeze(0), batch).squeeze(0)
-                    
-                    # Combine current and previous results
                     combined_distances = torch.cat([min_distances, batch_distances])
-                    combined_indices = torch.cat([min_indices, 
-                                               torch.arange(i, i + len(batch_distances), 
-                                                          device=self.device)])
-                    
-                    # Update top-k
+                    combined_indices = torch.cat([
+                        min_indices,
+                        torch.arange(i, i + len(batch_distances), device=self.device)
+                    ])
                     _, top_k_indices = torch.topk(combined_distances, self.k, largest=False)
                     min_distances = combined_distances[top_k_indices]
                     min_indices = combined_indices[top_k_indices]
-                
                 return min_indices.cpu()
-                
+
         except RuntimeError as e:
-            print(f"Error during neighbor search: {e}")
+            logger.error(f"Error during neighbor search: {e}")
             if "out of memory" in str(e):
                 torch.cuda.empty_cache()
                 raise
-            
-    def get_distances(self, batch_size=1000):
-        """Calculate all pairwise distances in parallel using batched matrix operations"""
-        try:
-            if self.feature_vectors.shape[0] < 2:
-                return {}
-                
-            distances_dict = {}
-            num_vectors = self.feature_vectors.shape[0]
 
-            # Normalize all vectors at once
-            all_normalized = self.feature_vectors / (torch.norm(self.feature_vectors, dim=1, keepdim=True) + 1e-8)
-            
-            # Calculate full similarity matrix in batches
-            for i in range(0, num_vectors, batch_size):
-                batch_end = min(i + batch_size, num_vectors)
-                
-                # Calculate similarities between current batch and all vectors
-                batch_similarities = torch.matmul(
-                    all_normalized[i:batch_end], 
-                    all_normalized.T  # Transpose for matrix multiplication
-                )
-                
-                # Convert to distances
-                batch_distances = 1 - batch_similarities
-                
-                # For each vector in batch, get k nearest neighbors
-                # excluding self-similarity
-                for j, idx in enumerate(range(i, batch_end)):
-                    # Zero out self-similarity
-                    distances = batch_distances[j].clone()
-                    distances[idx] = float('inf')
-                    
-                    # Get top k
-                    k = min(self.k, num_vectors - 1)
-                    topk_distances, _ = torch.topk(distances, k, largest=False)
-                    distances_dict[idx] = topk_distances
-                    
-                if self.device.type == "cuda":
-                    torch.cuda.empty_cache()
-                    
-            return distances_dict
-            
-        except Exception as e:
-            print(f"Error calculating distances: {e}")
-            return {}
+    def _get_cache_key(self, query_vector):
+        """
+        Generate a cache key for the query vector.
+        """
+        if len(query_vector.shape) == 1:
+            vec = query_vector
+        else:
+            vec = query_vector.reshape(-1)
+        return hash(vec.cpu().numpy().tobytes())
 
-    def aggregate_distances(self, method='mean'):
-        """Aggregate distances with validation"""
-        try:
-            if self.feature_vectors.shape[0] < 2:
-                return {0: 0.0}  # Return 0 distance for single vector
-                
-            distances_dict = self.get_distances()
-            if not distances_dict:
-                return {0: 0.0}
-                
-            aggregated = {}
-            
-            for idx, distances in distances_dict.items():
-                if distances.numel() == 0:
-                    continue
-                    
-                if method == 'mean':
-                    mean = torch.mean(distances).item()
-                    std = torch.std(distances).item() + 1e-8  # Add small epsilon to avoid division by zero
-                    agg_value = mean / std
-                elif method == 'min':
-                    agg_value = torch.min(distances).item()
-                else:
-                    agg_value = torch.mean(distances).item()
-                    
-                if not np.isnan(agg_value) and not np.isinf(agg_value):
-                    aggregated[idx] = agg_value
-                    
-            if not aggregated:
-                return {0: 0.0}
-                
-            return aggregated
-            
-        except Exception as e:
-            print(f"Error in aggregate_distances: {e}")
-            return {0: 0.0}
-        
+    @time_it
     def get_novelty(self, query_vector):
         """
-        Calculate novelty score as average distance to k nearest neighbors.
-        Returns a value between 0-1 where higher means more novel.
+        Compute novelty as average distance to k nearest neighbors.
         """
         try:
             if self.feature_vectors.shape[0] < 2:
                 return 0.0
 
-            #print(self.k)
+            # Try cache first
+            cache_key = self._get_cache_key(query_vector)
+            if cache_key in self._distance_cache:
+                self._cache_hits += 1
+                return self._distance_cache[cache_key]
                 
-            # Ensure query vector is on device and has correct shape
+            self._cache_misses += 1
+                
             query_vector = query_vector.to(self.device)
             if len(query_vector.shape) == 1:
-                query_vector = query_vector.unsqueeze(0)  # Add batch dimension
-                
-            # Normalize query vector
+                query_vector = query_vector.unsqueeze(0)
+
             query_norm = query_vector / (torch.norm(query_vector, dim=1, keepdim=True) + 1e-8)
-            
-            # Find k nearest neighbors efficiently
             indices = self.find_nearest_neighbors(query_vector.squeeze(), self.k)
             if indices is None or len(indices) == 0:
                 return 0.0
-                
-            # Get neighbors and normalize
+
             neighbors = self.feature_vectors[indices]
             if len(neighbors.shape) == 1:
                 neighbors = neighbors.unsqueeze(0)
-                
+
             neighbors_norm = neighbors / (torch.norm(neighbors, dim=1, keepdim=True) + 1e-8)
-            
-            # Calculate cosine similarities
             similarities = torch.matmul(query_norm, neighbors_norm.T)
-            
-            # Convert to distances (1 - similarity) and get mean
             distances = 1 - similarities
             novelty_score = torch.mean(distances).item()
-            
-            # Normalize to 0-1 range
             novelty_score = min(max(novelty_score, 0.0), 1.0)
             
-            return novelty_score
+            # Store in cache
+            self._distance_cache[cache_key] = novelty_score
             
+            # Limit cache size
+            if len(self._distance_cache) > 10000:
+                # Remove random 20% of entries
+                keys = list(self._distance_cache.keys())
+                to_remove = random.sample(keys, int(len(keys) * 0.2))
+                for key in to_remove:
+                    del self._distance_cache[key]
+                    
+            return novelty_score
+
         except Exception as e:
-            print(f"Error calculating novelty: {e}")
-            print(f"Query vector shape: {query_vector.shape}")
-            print(f"Feature vectors shape: {self.feature_vectors.shape}")
+            logger.error(f"Error calculating novelty: {e}")
             return 0.0
-        
+
+    @time_it
     def batch_get_novelty(self, query_vectors):
         """
-        Calculate novelty scores for multiple query vectors at once.
-        Args:
-            query_vectors: torch.Tensor of shape (batch_size, feature_dim) or (batch_size, 1, feature_dim)
-        Returns:
-            torch.Tensor of shape (batch_size,) containing novelty scores
+        Batch version of get_novelty for multiple queries.
         """
         try:
             if self.feature_vectors.shape[0] < 2:
                 return torch.zeros(query_vectors.shape[0], device=self.device)
-            
-            # Ensure query vectors are on device and have correct shape
+
             query_vectors = query_vectors.to(self.device)
-            if len(query_vectors.shape) == 3:  # Shape: [batch_size, 1, feature_dim]
-                query_vectors = query_vectors.squeeze(1)  # Convert to [batch_size, feature_dim]
-            elif len(query_vectors.shape) == 1:  # Shape: [feature_dim]
-                query_vectors = query_vectors.unsqueeze(0)  # Convert to [1, feature_dim]
-            
-            # Normalize all vectors at once (add small epsilon to avoid division by zero)
+            if len(query_vectors.shape) == 3:
+                query_vectors = query_vectors.squeeze(1)
+            elif len(query_vectors.shape) == 1:
+                query_vectors = query_vectors.unsqueeze(0)
+
             query_norm = query_vectors / (torch.norm(query_vectors, dim=1, keepdim=True) + 1e-8)
             neighbors_norm = self.feature_vectors / (torch.norm(self.feature_vectors, dim=1, keepdim=True) + 1e-8)
-            
-            # Calculate all pairwise similarities at once
-            similarities = torch.matmul(query_norm, neighbors_norm.T)  # shape: (batch_size, num_neighbors)
-            
-            # For each query, get k nearest neighbors
-            _, top_k_indices = torch.topk(similarities, min(self.k, similarities.shape[1]), dim=1, largest=True)
-            
-            # Gather the k nearest neighbor similarities for each query
-            top_k_similarities = torch.gather(similarities, 1, top_k_indices)
-            
-            # Convert similarities to distances and compute mean for each query
-            distances = 1 - top_k_similarities
-            novelty_scores = torch.mean(distances, dim=1)  # shape: [batch_size]
-            
-            # Normalize to 0-1 range
+            similarities = torch.matmul(query_norm, neighbors_norm.T)
+            topk_sim, _ = torch.topk(similarities, min(self.k, similarities.shape[1]), dim=1, largest=True)
+            distances = 1 - topk_sim
+            novelty_scores = torch.mean(distances, dim=1)
             novelty_scores = torch.clamp(novelty_scores, 0.0, 1.0)
-            
             return novelty_scores
-            
+
         except Exception as e:
-            print(f"Error in batch_get_novelty: {e}")
-            print(f"Query vectors shape: {query_vectors.shape}")
-            print(f"Feature vectors shape: {self.feature_vectors.shape}")
+            logger.error(f"Error in batch_get_novelty: {e}")
             return torch.zeros(query_vectors.shape[0], device=self.device)
-        
+
+    @time_it
     def batch_get_novelty_stream(self, query_vectors, stream):
         """
-        Stream-aware version of batch_get_novelty that works with CUDA streams
-        Args:
-            query_vectors: torch.Tensor of shape (batch_size, feature_dim) or (batch_size, 1, feature_dim)
-            stream: torch.cuda.Stream instance
-        Returns:
-            torch.Tensor of shape (batch_size,) containing novelty scores
+        CUDA stream-aware batch novelty for parallel processing.
         """
         try:
             if self.feature_vectors.shape[0] < 2:
                 return torch.zeros(query_vectors.shape[0], device=self.device)
-            
+
             with torch.cuda.stream(stream):
-                # Ensure query vectors are on device and have correct shape
                 query_vectors = query_vectors.to(self.device, non_blocking=True)
                 if len(query_vectors.shape) == 3:
                     query_vectors = query_vectors.squeeze(1)
                 elif len(query_vectors.shape) == 1:
                     query_vectors = query_vectors.unsqueeze(0)
+
+                # Check cache for each vector in the batch
+                novelty_scores = torch.zeros(query_vectors.shape[0], device=self.device)
+                uncached_indices = []
                 
-                # Normalize vectors (use separate streams for parallelization)
-                query_norm = query_vectors / (torch.norm(query_vectors, dim=1, keepdim=True) + 1e-8)
+                for i, query in enumerate(query_vectors):
+                    cache_key = self._get_cache_key(query)
+                    if cache_key in self._distance_cache:
+                        self._cache_hits += 1
+                        novelty_scores[i] = self._distance_cache[cache_key]
+                    else:
+                        self._cache_misses += 1
+                        uncached_indices.append(i)
+                        
+                # If all queries were cached, return early
+                if not uncached_indices:
+                    return novelty_scores
+                    
+                # Process only uncached queries
+                uncached_queries = query_vectors[uncached_indices]
+                query_norm = uncached_queries / (torch.norm(uncached_queries, dim=1, keepdim=True) + 1e-8)
                 neighbors_norm = self.feature_vectors / (torch.norm(self.feature_vectors, dim=1, keepdim=True) + 1e-8)
-                
-                # Calculate similarities
+
                 similarities = torch.matmul(query_norm, neighbors_norm.T)
-                
-                # Get k nearest neighbors
                 _, top_k_indices = torch.topk(similarities, min(self.k, similarities.shape[1]), dim=1, largest=True)
-                
-                # Gather similarities and compute novelty
                 top_k_similarities = torch.gather(similarities, 1, top_k_indices)
                 distances = 1 - top_k_similarities
-                novelty_scores = torch.mean(distances, dim=1)
+                uncached_scores = torch.mean(distances, dim=1)
+                uncached_scores = torch.clamp(uncached_scores, 0.0, 1.0)
                 
-                # Normalize scores
-                novelty_scores = torch.clamp(novelty_scores, 0.0, 1.0)
+                # Update cache
+                for i, idx in enumerate(uncached_indices):
+                    cache_key = self._get_cache_key(query_vectors[idx])
+                    score = uncached_scores[i].item()
+                    self._distance_cache[cache_key] = score
+                    novelty_scores[idx] = score
+                
+                # Limit cache size occasionally
+                if random.random() < 0.01 and len(self._distance_cache) > 10000:
+                    keys = list(self._distance_cache.keys())
+                    to_remove = random.sample(keys, int(len(keys) * 0.2))
+                    for key in to_remove:
+                        del self._distance_cache[key]
                 
                 return novelty_scores
-                
+
         except Exception as e:
-            print(f"Error in batch_get_novelty_stream: {e}")
-            print(f"Query vectors shape: {query_vectors.shape}")
-            print(f"Feature vectors shape: {self.feature_vectors.shape}")
+            logger.error(f"Error in batch_get_novelty_stream: {e}")
             return torch.zeros(query_vectors.shape[0], device=self.device)
 
+    @time_it
     def add_feature_vectors(self, new_feature_vectors, step=0):
         """
-        Add new feature vectors and recalculate optimal k using elbow method
+        Add new vectors to the kNN dataset. Possibly recalc k using elbow method.
         """
         try:
             new_feature_vectors = new_feature_vectors.to(self.device)
-            
-            # Ensure correct shape
             if len(new_feature_vectors.shape) == 1:
                 new_feature_vectors = new_feature_vectors.unsqueeze(0)
             elif len(new_feature_vectors.shape) == 3:
                 new_feature_vectors = new_feature_vectors.squeeze(1)
-                
-            # Validate new vectors
+
             if torch.isnan(new_feature_vectors).any():
-                print("Warning: NaN values in new feature vectors")
+                logger.warning("NaN values detected in new feature vectors.")
                 return
-                
+
             if self.feature_vectors.numel() == 0:
                 self.feature_vectors = new_feature_vectors
             else:
                 self.feature_vectors = torch.cat((self.feature_vectors, new_feature_vectors), dim=0)
+
+            # Invalidate the index - will be rebuilt when needed
+            self._index = None
             
-            # Recalculate optimal k if we have enough vectors every 3 steps
-            if step % 3 == 0 and self.feature_vectors.shape[0] >= 3:
-                if self.feature_vectors.shape[0] >= 3:  # Need at least 3 points for elbow method
-                    self.k = self.calculate_k_elbow()
-                    #print(f"Recalculated optimal k = {self.k}")
+            # Clear some of the cache occasionally
+            if random.random() < 0.1 and len(self._distance_cache) > 5000:
+                keys = list(self._distance_cache.keys())
+                to_remove = random.sample(keys, int(len(keys) * 0.2))
+                for key in to_remove:
+                    del self._distance_cache[key]
+
+            # Update k less frequently based on config
+            should_update = (step % self.k_update_frequency == 0) and self.random_threshold > 0.7
             
+            self.random_threshold = self.random_gen.random()
+            if should_update:
+                if step % self.k_update_frequency == 0 and self.feature_vectors.shape[0] >= 3:
+                    if self.last_update_step != step:
+                        self.last_update_step = step
+                        self.k = self.calculate_k_elbow()
+                        logger.debug(f"Recalculated optimal k={self.k} for agent {self.agent_id}")
+
         except Exception as e:
-            print(f"Error adding feature vectors: {e}")
+            logger.error(f"Error adding feature vectors: {e}")
+
+    def clear_caches(self):
+        """
+        Clear all internal caches.
+        """
+        self._distance_cache = {}
+        self._index = None
+        logger.debug(f"Cleared kNN caches for agent {self.agent_id}. Hits: {self._cache_hits}, Misses: {self._cache_misses}")
 
     def get_memory_usage(self):
         """
-        Get current GPU memory usage.
-        :return: Dictionary containing memory usage statistics
+        Return current GPU memory usage stats.
         """
         if self.device.type == "cuda":
             return {
                 "allocated": torch.cuda.memory_allocated(0)//1024**2,
-                "cached": torch.cuda.memory_reserved(0)//1024**2
+                "reserved": torch.cuda.memory_reserved(0)//1024**2
             }
-        return {"allocated": 0, "cached": 0}
-    
+        return {"allocated": 0, "reserved": 0}
+
     def save(self, path):
         """
-        Save the kNN instance to a file.
-        :param path: The path where the kNN instance should be saved
+        Save kNN state to disk (moves feature_vectors to CPU first).
         """
-        # Move to CPU before saving
         cpu_state = {
             'k': self.k,
             'feature_vectors': self.feature_vectors.cpu()
         }
         torch.save(cpu_state, path)
-        
+
     @staticmethod
     def load(path):
         """
-        Load a kNN instance from a file.
-        :param path: The path from which to load the kNN instance
-        :return: The loaded kNN instance
+        Load kNN state from disk.
         """
         state = torch.load(path)
-        instance = kNN(k=state['k'])
+        instance = kNN()
+        instance.k = state['k']
         instance.feature_vectors = state['feature_vectors'].to(instance.device)
         return instance
 
+
 if __name__ == "__main__":
-    # Example usage
+    # Basic usage example
     try:
-        # Create instance
-        knn = kNN(k=5)
-        
-        # Generate test data
+        knn = kNN(agent_id=0)
         test_vectors = torch.randn(1000, 64).to(knn.device)
         query = torch.randn(64).to(knn.device)
-        
-        # Add vectors
         knn.add_feature_vectors(test_vectors)
-        
-        # Find neighbors
         neighbors = knn.find_nearest_neighbors(query)
-        
-        print(f"Found {len(neighbors)} nearest neighbors")
-        print(f"Memory usage: {knn.get_memory_usage()}")
-        
+        logger.info(f"Found {len(neighbors)} nearest neighbors for query.")
+        logger.info(f"Memory usage: {knn.get_memory_usage()}")
     except RuntimeError as e:
-        print(f"Error during testing: {e}")
+        logger.error(f"Error in knn testing: {e}")
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
