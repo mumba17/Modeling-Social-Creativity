@@ -4,12 +4,26 @@ from collections import defaultdict
 from typing import Dict
 import threading
 import numpy as np
+import logging # Import logging
 
 ENABLE_TIMING = True
 
 _recursion_depths = defaultdict(int)
 _start_times = defaultdict(float)
 
+# Get a logger for this module
+# Use the root simulation logger if available, otherwise get a default logger
+try:
+    # Attempt to get the simulation logger configured elsewhere
+    from logging_utils import _simulation_logger as logger
+    if logger is None: # Fallback if not yet configured
+        logger = logging.getLogger(__name__)
+except ImportError:
+    # Fallback if logging_utils cannot be imported (e.g., during testing)
+    logger = logging.getLogger(__name__)
+
+# Set a default level if needed, although the root config should handle it
+# logger.setLevel(logging.INFO)
 
 class TimingStats:
     """
@@ -58,13 +72,27 @@ class TimingStats:
 
     def print_step_report(self):
         """
-        Print a formatted report of current step timing statistics.
+        Log a formatted report of current step timing statistics using the logger.
         """
         stats = self.get_step_stats()
+        if not stats:
+            logger.info("No timing statistics recorded for this step.")
+            return
+
         sorted_funcs = sorted(stats.items(), key=lambda x: x[1]['total_time'], reverse=True)
+
+        # Log header using logger.info
+        header = f"{'Function':<40} {'Total Time (s)':<15} {'Calls':<8} {'Mean (s)':<12} {'Std Dev (s)':<12}"
+        logger.info("--- Timing Report --- ")
+        logger.info(header)
+        logger.info("-" * len(header))
+
+        # Log each function's stats using logger.info
         for func_name, func_stats in sorted_funcs:
-            print(f"{func_name:<40} {func_stats['total_time']:<12.4f} {func_stats['calls']:<8} "
-                  f"{func_stats['mean']:<10.4f} {func_stats['std']:<10.4f}")
+            log_line = (f"{func_name:<40} {func_stats['total_time']:<15.4f} {func_stats['calls']:<8} "
+                        f"{func_stats['mean']:<12.4f} {func_stats['std']:<12.4f}")
+            logger.info(log_line)
+        logger.info("--- End Timing Report ---")
 
     def reset_step(self):
         """

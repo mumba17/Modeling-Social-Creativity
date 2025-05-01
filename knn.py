@@ -5,6 +5,8 @@ import random
 
 from timing_utils import time_it
 import config
+# Add log_event import
+from logging_utils import log_event
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -21,6 +23,7 @@ class kNN:
         """
         Parameters
         ----------
+
         agent_id : int, optional
             Identifier for debugging/logging
         """
@@ -59,11 +62,13 @@ class kNN:
 
         Parameters
         ----------
+
         n_samples : int
         n_features : int
 
         Returns
         -------
+
         int
             Maximum recommended k
         """
@@ -82,10 +87,12 @@ class kNN:
 
         Parameters
         ----------
+
         max_k : int
 
         Returns
         -------
+
         list
             Sequence of candidate k values
         """
@@ -120,6 +127,7 @@ class kNN:
 
         Returns
         -------
+
         int
             Optimal k for this dataset
         """
@@ -465,8 +473,12 @@ class kNN:
     def add_feature_vectors(self, new_feature_vectors, step=0):
         """
         Add new vectors to the kNN dataset. Possibly recalc k using elbow method.
+        Logs the addition event.
         """
         try:
+            num_added = new_feature_vectors.shape[0]
+            original_size = self.feature_vectors.shape[0]
+            
             new_feature_vectors = new_feature_vectors.to(self.device)
             if len(new_feature_vectors.shape) == 1:
                 new_feature_vectors = new_feature_vectors.unsqueeze(0)
@@ -474,7 +486,16 @@ class kNN:
                 new_feature_vectors = new_feature_vectors.squeeze(1)
 
             if torch.isnan(new_feature_vectors).any():
-                logger.warning("NaN values detected in new feature vectors.")
+                logger.warning(f"Agent {self.agent_id}: NaN values detected in new feature vectors. Skipping addition.")
+                # Log NaN event
+                log_event(
+                    step=step,
+                    event_type='knn_add_nan_skipped',
+                    agent_id=self.agent_id,
+                    details={
+                        'num_vectors_attempted': num_added
+                    }
+                )
                 return
 
             if self.feature_vectors.numel() == 0:
@@ -484,6 +505,18 @@ class kNN:
 
             # Invalidate the index - will be rebuilt when needed
             self._index = None
+            
+            # Log successful addition
+            log_event(
+                step=step,
+                event_type='knn_vectors_added',
+                agent_id=self.agent_id,
+                details={
+                    'num_added': num_added,
+                    'new_total_vectors': self.feature_vectors.shape[0],
+                    'original_total_vectors': original_size
+                }
+            )
             
             # Clear some of the cache occasionally
             if random.random() < 0.1 and len(self._distance_cache) > 5000:
@@ -504,7 +537,17 @@ class kNN:
                         logger.debug(f"Recalculated optimal k={self.k} for agent {self.agent_id}")
 
         except Exception as e:
-            logger.error(f"Error adding feature vectors: {e}")
+            logger.error(f"Agent {self.agent_id}: Error adding feature vectors: {e}")
+            # Log error event
+            log_event(
+                step=step,
+                event_type='knn_add_error',
+                agent_id=self.agent_id,
+                details={
+                    'error_message': str(e),
+                    'num_vectors_attempted': new_feature_vectors.shape[0] if 'new_feature_vectors' in locals() else 'unknown'
+                }
+            )
 
     def clear_caches(self):
         """
@@ -553,7 +596,7 @@ if __name__ == "__main__":
         knn = kNN(agent_id=0)
         test_vectors = torch.randn(1000, 64).to(knn.device)
         query = torch.randn(64).to(knn.device)
-        knn.add_feature_vectors(test_vectors)
+        knn.add_feature_vectors(test_vectors, step=0)
         neighbors = knn.find_nearest_neighbors(query)
         logger.info(f"Found {len(neighbors)} nearest neighbors for query.")
         logger.info(f"Memory usage: {knn.get_memory_usage()}")

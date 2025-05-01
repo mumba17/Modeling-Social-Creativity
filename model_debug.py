@@ -51,6 +51,7 @@ class Agent(mesa.Agent):
         model : Model
             Reference to the Mesa Model instance
         """
+        print(f"Initializing Agent {unique_id}...")
         super().__init__(unique_id, model)
         self.unique_id = unique_id
 
@@ -97,6 +98,7 @@ class Agent(mesa.Agent):
 
         # Communication inbox
         self.inbox = []
+        print(f"Agent {unique_id} initialized successfully")
 
     @time_it
     def hedonic_evaluation(self, novelty):
@@ -236,6 +238,7 @@ class Model(mesa.Model):
         log_dir : str, optional
             Logging directory for TensorBoard and CSV outputs.
         """
+        print("Starting Model initialization...")
         super().__init__()
         self.num_agents = number_agents
         self.output_dims = output_dims
@@ -244,27 +247,38 @@ class Model(mesa.Model):
         # Logging directories
         self.log_dir = log_dir or f"logs/run_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_v2"
         os.makedirs(self.log_dir, exist_ok=True)
+        print(f"Created log directory: {self.log_dir}")
 
         # Initialize system-wide TensorBoard writer
+        print("Initializing TensorBoard writer...")
         self.writer = SummaryWriter(log_dir=self.log_dir)
+        print("TensorBoard writer initialized")
 
         # Set up logging
+        print("Setting up JSON logger...")
         try:
             self.json_logger = setup_logger(self.log_dir)
+            print("JSON logger initialized successfully")
         except Exception as e:
+            print(f"ERROR in JSON logger setup: {e}")
             logger.warning(f"Error initializing JSON logger: {e}. Falling back to simple logging.")
             self.json_logger = logging.getLogger('simulation')
             handler = logging.FileHandler(os.path.join(self.log_dir, "simulation.log"))
             self.json_logger.addHandler(handler)
 
         # Initialize network tracker before heavy components
+        print("Initializing network tracker...")
         self.network_tracker = NetworkTracker(number_agents, self.log_dir)
+        print("Network tracker initialized")
 
-        # Initialize image saver with proper directory structure        
+        # Initialize image saver with proper directory structure  
+        print("Initializing image saver...")      
         try:
             self.image_saver = ImageSaver(self.log_dir)
             self.image_dir = os.path.join(self.log_dir, "images") 
+            print(f"Image saver initialized successfully with directory: {self.image_dir}")
         except Exception as e:
+            print(f"ERROR in image saver initialization: {e}")
             logger.warning(f"Error initializing structured image saver: {e}")
             # Fall back to simple directory structure
             self.image_saver = ImageSaver()
@@ -303,14 +317,24 @@ class Model(mesa.Model):
         self.successful_interactions = np.zeros((number_agents, number_agents))
 
         # Feature extraction, image generation - these are heavy operations
+        print("Initializing feature extractor (this might take a while)...")
+        sys.stdout.flush()  # Ensure print is displayed immediately
         self.feature_extractor = FeatureExtractor(output_dims=self.output_dims)
+        print("Feature extractor initialized successfully")
+        
+        print("Initializing image generator...")
+        sys.stdout.flush()  # Ensure print is displayed immediately
         self.image_generator = genart.ImageGenerator(32, 32)
+        print("Image generator initialized successfully")
 
         # Create agents
+        print(f"Creating {number_agents} agents...")
         self._initialize_agents()
+        print("All agents initialized successfully")
 
         # For Mesa run loop
         self.running = True
+        print("Model initialization complete!")
 
     def _initialize_agents(self):
         """
@@ -318,6 +342,7 @@ class Model(mesa.Model):
         """
         for i in range(self.num_agents):
             if i % 10 == 0:  # Print status every 10 agents
+                print(f"Initializing agent {i}/{self.num_agents}...")
                 sys.stdout.flush()
             agent = Agent(i, self)
             self.schedule.add(agent)
@@ -405,6 +430,7 @@ class Model(mesa.Model):
         """
         Add a new artifact to the domain repository.
         """
+        print(f"Adding artifact to domain (current size: {len(self.domain)})")
         if len(self.domain) >= self.max_domain_size:
             self.domain.pop(0)
 
@@ -421,6 +447,7 @@ class Model(mesa.Model):
             'step': domain_entry['timestamp']
         }
         
+        print(f"Queueing domain image save with metadata: {metadata}")
         # Queue the image save with metadata
         image_path = None
         if 'image' in artifact:
@@ -428,6 +455,9 @@ class Model(mesa.Model):
                 artifact['image'],
                 metadata=metadata
             )
+            print(f"Domain image queued with path: {image_path}")
+        else:
+            print("No image in artifact to save")
             
         # Store the path in the domain entry and remove the image object to save memory
         if image_path:
@@ -441,6 +471,7 @@ class Model(mesa.Model):
         self.writer.add_scalar('domain/total_size', len(self.domain), self.schedule.time)
         self.writer.add_scalar('domain/last_interest', domain_entry['interest'], self.schedule.time)
         self.writer.add_scalar('domain/last_novelty', domain_entry['novelty'], self.schedule.time)
+        print(f"Domain updated, new size: {len(self.domain)}")
 
     @time_it
     def get_random_domain_artifact(self):
@@ -464,8 +495,10 @@ class Model(mesa.Model):
             if image_path:
                 try:
                     # Try to load the image
+                    print(f"Loading domain artifact image from: {image_path}")
                     full_path = os.path.join(self.log_dir, image_path)
                     if not os.path.exists(full_path):
+                        print(f"WARNING: Image file not found at: {full_path}")
                         continue
                         
                     image = Image.open(full_path)
@@ -480,6 +513,7 @@ class Model(mesa.Model):
                     # Get features - may need to extract if not available
                     features = domain_entry.get('features') or domain_entry.get('artifact', {}).get('features')
                     if features is None:
+                        print("Extracting features for domain artifact")
                         features = self.feature_extractor.extract_features(image)
                     
                     # Return artifact with loaded image
@@ -490,8 +524,10 @@ class Model(mesa.Model):
                         'image_path': image_path
                     }
                 except Exception as e:
+                    print(f"Error loading artifact image {image_path}: {e}")
                     continue
         
+        print("Could not find a valid artifact with available image")
         return None
 
     @time_it
@@ -501,8 +537,10 @@ class Model(mesa.Model):
         Each message includes an artifact with features. The receiving
         agent computes novelty and decides whether to accept it.
         """
+        print(f"Processing inboxes at step {self.schedule.time}")
         if not torch.cuda.is_available():
             # Fallback to simple batch if no CUDA
+            print("No CUDA available, using batch processing")
             self.process_inboxes_batch()
             return
 
@@ -530,8 +568,10 @@ class Model(mesa.Model):
                     agent_indices.append(agent_idx)
 
         if not all_features:
+            print("No messages with features found")
             return
 
+        print(f"Processing {len(all_features)} messages")
         try:
             # Process messages in smaller batches to avoid OOM issues
             BATCH_SIZE = 256
@@ -739,10 +779,12 @@ class Model(mesa.Model):
         """
         Parallel generation of expressions, images, and features.
         """
+        print(f"Starting generations for step {self.schedule.time}")
         # Generate expression for each agent
         for agent in self.schedule.agents:
             if not agent.current_expression:
                 # Create a random expression if needed
+                print(f"Creating new random expression for agent {agent.unique_id}")
                 agent.current_expression = genart.ExpressionNode.create_random(depth=agent.gen_depth)
             else:
                 # Decide whether to mutate or breed based on interest
@@ -753,27 +795,34 @@ class Model(mesa.Model):
                     if isinstance(parent2_data, dict) and 'expression_str' in parent2_data:
                         try:
                             parent2 = genart.ExpressionNode.from_string(parent2_data['expression_str'])
+                            print(f"Breeding expression for agent {agent.unique_id}")
                             agent.current_expression = parent1.breed(parent2, agent_id=agent.unique_id, step=self.schedule.time)
                         except Exception as e:
+                            print(f"Error breeding for agent {agent.unique_id}: {e}")
                             logger.warning(f"Error breeding for agent {agent.unique_id}: {e}")
                             # Fall back to mutation
                             agent.current_expression = parent1.mutate(agent_id=agent.unique_id, step=self.schedule.time)
                     else:
                         # Fall back to mutation
+                        print(f"Mutating expression for agent {agent.unique_id}")
                         agent.current_expression = agent.current_expression.mutate(agent_id=agent.unique_id, step=self.schedule.time)
                 else:
                     # Mutate the existing expression
+                    print(f"Mutating expression for agent {agent.unique_id}")
                     agent.current_expression = agent.current_expression.mutate(agent_id=agent.unique_id, step=self.schedule.time)
 
         # Process in batches for better GPU utilization
         batch_size = 32
+        print(f"Processing agent generation in batches of {batch_size}")
         for batch_start in range(0, len(self.schedule.agents), batch_size):
             batch_end = min(batch_start + batch_size, len(self.schedule.agents))
             batch_agents = self.schedule.agents[batch_start:batch_end]
+            print(f"Processing batch {batch_start}-{batch_end}")
             
             # Generate images and extract features for the batch
             for agent in batch_agents:
                 try:
+                    print(f"Generating image for agent {agent.unique_id}")
                     # Generate image from expression
                     expr = agent.current_expression
                     img = self.image_generator.generate(expr)
@@ -781,6 +830,7 @@ class Model(mesa.Model):
                     agent.generated_expression = expr.to_string()
                     
                     # Save image with agent context
+                    print(f"Saving image for agent {agent.unique_id}")
                     metadata = {
                         'step': self.schedule.time,
                         'type': 'generation'
@@ -790,11 +840,14 @@ class Model(mesa.Model):
                         agent.unique_id,
                         metadata=metadata
                     )
+                    print(f"Image path for agent {agent.unique_id}: {image_path}")
                     
                     # Extract features
+                    print(f"Extracting features for agent {agent.unique_id}")
                     features = self.feature_extractor.extract_features(img)
                     
                     # Get raw novelty
+                    print(f"Calculating novelty for agent {agent.unique_id}")
                     if hasattr(agent.knn, 'get_index_size') and agent.knn.get_index_size() > 0:
                         novelty_raw = agent.knn.get_novelty(features)
                     else:
@@ -804,12 +857,15 @@ class Model(mesa.Model):
                     normalized_novelty = self.normalise_novelty(novelty_raw.item())
                     
                     # Calculate interest
+                    print(f"Evaluating interest for agent {agent.unique_id}")
                     interest = agent.hedonic_evaluation(normalized_novelty)
                     
                     # Update KNN
+                    print(f"Updating KNN for agent {agent.unique_id}")
                     agent.knn.add_feature_vectors(features, self.schedule.time)
                     
                     # Log generation
+                    print(f"Logging generation for agent {agent.unique_id}")
                     log_event(
                         step=self.schedule.time,
                         event_type='artifact_generated',
@@ -825,6 +881,7 @@ class Model(mesa.Model):
                     )
                     
                     # Save to agent memory
+                    print(f"Updating memory for agent {agent.unique_id}")
                     agent.artifact_memory.append({
                         'expression_str': expr.to_string(),
                         'features': features.cpu(),
@@ -837,6 +894,7 @@ class Model(mesa.Model):
                     
                     # Possibly share with other agents
                     if interest > self.self_threshold:
+                        print(f"Agent {agent.unique_id} sharing artifact")
                         # Log the sharing event
                         log_event(
                             step=self.schedule.time,
@@ -869,12 +927,15 @@ class Model(mesa.Model):
                             recipient.inbox.append(message)
                     
                 except Exception as e:
+                    print(f"ERROR in generation for agent {agent.unique_id}: {e}")
                     logger.error(f"Error in generation for agent {agent.unique_id}: {e}")
                     
             # Process image save queue to avoid memory buildup
+            print("Processing image save queue")
             self.image_saver.process_save_queue()
             
         # Release memory
+        print("Clearing image memory")
         for agent in self.schedule.agents:
             agent.generated_image = None
     
@@ -964,17 +1025,32 @@ class Model(mesa.Model):
           5) Log network metrics.
           6) Mesa schedule step.
         """
+        print(f"\n\n=== Starting step {self.schedule.time} ===")
+        
+        print("Processing image save queue")
         self.image_saver.process_save_queue()
+        
+        print("Processing inboxes")
         self.process_inboxes_parallel()
+        
+        print("Generating new artifacts")
         self.process_generations_parallel()
+        
+        print("Calculating novelty thresholds")
         self.calculate_novelty_threshold()
 
         # Update novelty bounds occasionally
         if self.schedule.time % 5 == 0 or self.schedule.time in [1, 2]:
+            print("Updating novelty bounds")
             self.update_novelty_bounds()
 
+        print("Logging system metrics")
         self.log_system_metrics()
+        
+        print("Running Mesa schedule step")
         self.schedule.step()
+        
+        print(f"=== Completed step {self.schedule.time-1} ===\n")
 
     def run_model(self, steps=config.EXPERIMENT_STEPS):
         """
@@ -985,18 +1061,21 @@ class Model(mesa.Model):
         steps : int
             Number of steps to run the simulation
         """
+        print(f"Starting simulation run for {steps} steps")
         for step_i in range(steps):
             TimingStats().reset_step()
             self.step()
             TimingStats().print_step_report()
 
         # Cleanup
+        print("Simulation complete, performing cleanup...")
         self.writer.close()
         self.image_saver.stop() # Use stop instead of just process_save_queue
         # Close the logger handlers properly
         for handler in self.json_logger.handlers[:]:
             handler.close()
             self.json_logger.removeHandler(handler)
+        print("Cleanup complete")
 
 
 @time_it
@@ -1016,6 +1095,7 @@ def run_sim_from_config():
     log_dir = os.path.join("logs", f"single_sim_{timestamp}")
     os.makedirs(log_dir, exist_ok=True)
 
+    print(f"Initializing model with log directory: {log_dir}")
     model = Model(
         number_agents=config.NUMBER_AGENTS,
         output_dims=config.OUTPUT_DIMS,
@@ -1023,12 +1103,14 @@ def run_sim_from_config():
     )
 
     try:
+        print(f"Starting simulation for {config.EXPERIMENT_STEPS} steps")
         for _ in tqdm(range(config.EXPERIMENT_STEPS), desc="Simulation Progress"):
             TimingStats().reset_step()
             model.step()
             TimingStats().print_step_report()
     finally:
         # Ensure cleanup happens even on error
+        print("Simulation finished or interrupted, cleaning up...")
         if hasattr(model, 'writer'):
             model.writer.close()
         
@@ -1048,6 +1130,9 @@ def run_sim_from_config():
                     model.json_logger.removeHandler(handler)
                 except Exception as e:
                     logger.error(f"Error closing logger handler: {e}")
+                    
+        print(f"Simulation completed. Results saved in: {log_dir}")
 
 if __name__ == "__main__":
+    print("Starting simulation script...")
     run_sim_from_config()

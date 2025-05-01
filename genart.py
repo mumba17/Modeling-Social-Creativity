@@ -13,6 +13,16 @@ import time
 
 from timing_utils import time_it
 
+# Conditionally import log_event if the module exists
+try:
+    from logging_utils import log_event
+    HAS_LOG_EVENT = True
+except ImportError:
+    HAS_LOG_EVENT = False
+    # Define a dummy log_event function that does nothing
+    def log_event(step, event_type, agent_id, details=None):
+        pass
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
@@ -568,10 +578,22 @@ class ExpressionNode:
             # Fallback to zero on error
             return QuaternionTensor(torch.zeros(coords_shape, device=device))
 
-    def mutate(self, rate=0.1):
+    def mutate(self, rate=0.1, agent_id=None, step=None):
         """
         Randomly mutate this node's operator, and recursively mutate children.
+        
+        Parameters
+        ----------
+        rate : float
+            Probability of mutation at each node
+        agent_id : int, optional
+            If provided along with step, logs mutation events
+        step : int, optional
+            Current simulation step for logging
         """
+        mutated_here = False
+        original_op_str = OPERATOR_TO_STRING.get(self.operator, 'coord')
+        
         if random.random() < rate:
             valid_ops = [(op, op_type) for op, op_type in OPERATORS
                          if op in OPERATOR_TO_STRING]
@@ -580,42 +602,110 @@ class ExpressionNode:
             self.op_type = new_op[1]
             self.constant = False
             self.value = None
+            mutated_here = True
+
+            # Log mutation if context provided and logging is available
+            if HAS_LOG_EVENT and agent_id is not None and step is not None:
+                log_event(
+                    step=step,
+                    event_type='mutation_applied',
+                    agent_id=agent_id,
+                    details={
+                        'original_operator': original_op_str,
+                        'new_operator': OPERATOR_TO_STRING.get(self.operator, 'unknown'),
+                        # Consider adding node depth or path if needed
+                    }
+                )
+                logger.debug(f"Agent {agent_id}: Mutated operator from {original_op_str} to {OPERATOR_TO_STRING.get(self.operator, 'unknown')}")
 
         if self.left:
-            self.left.mutate(rate)
+            self.left.mutate(rate, agent_id=agent_id, step=step)
         if self.right:
-            self.right.mutate(rate)
+            self.right.mutate(rate, agent_id=agent_id, step=step)
+            
+        return self  # Return self for chaining
 
-    def breed(self, other: 'ExpressionNode') -> 'ExpressionNode':
+    def breed(self, other: 'ExpressionNode', agent_id=None, step=None) -> 'ExpressionNode':
         """
         Cross-over / combine this node with another ExpressionNode.
         Respects MAX_EXPRESSION_DEPTH from config if available.
+        
+        Parameters
+        ----------
+        other : ExpressionNode
+            The other parent expression to breed with
+        agent_id : int, optional
+            If provided along with step, logs breeding events
+        step : int, optional
+            Current simulation step for logging
+            
+        Returns
+        -------
+        ExpressionNode
+            A new expression created by combining this one with other
         """
         import config
         
+        # Decide which expression is base and which is donor
         if random.random() < 0.5:
             new_expr = self._copy()
             donor = other
+            parent1_str = self.to_string() if HAS_LOG_EVENT else None  # Only compute if needed
+            parent2_str = other.to_string() if HAS_LOG_EVENT else None
         else:
             new_expr = other._copy()
             donor = self
+            parent1_str = other.to_string() if HAS_LOG_EVENT else None
+            parent2_str = self.to_string() if HAS_LOG_EVENT else None
 
+        # Select random nodes for crossover
         target_node = new_expr._random_node()
         donor_node = donor._random_node()
+        donor_copy = donor_node._copy()
 
-        if target_node.left:
-            target_node.left = donor_node._copy()
-        else:
-            target_node.right = donor_node._copy()
+        # Perform crossover
+        original_subtree_str = None
+        if target_node.left and random.random() < 0.5:  # Replace left more often if exists
+            if HAS_LOG_EVENT:
+                original_subtree_str = target_node.left.to_string() if target_node.left else 'coord'
+            target_node.left = donor_copy
+        elif target_node.right:
+            if HAS_LOG_EVENT:
+                original_subtree_str = target_node.right.to_string() if target_node.right else 'coord'
+            target_node.right = donor_copy
+        else:  # If target is a leaf or unary with only left, replace left
+            if HAS_LOG_EVENT:
+                original_subtree_str = target_node.left.to_string() if target_node.left else 'coord'
+            target_node.left = donor_copy
 
         # Limit depth if needed
+        simplified = False
         if hasattr(config, 'MAX_EXPRESSION_DEPTH'):
-            # Calculate current depth
             depth = new_expr._get_max_depth()
             if depth > config.MAX_EXPRESSION_DEPTH:
-                # Simplify the expression if it's too deep
-                new_expr._simplify_to_depth(config.MAX_EXPRESSION_DEPTH)
+                simplified = new_expr._simplify_to_depth(config.MAX_EXPRESSION_DEPTH)
         
+        # Log breed operation if context provided and logging is available
+        if HAS_LOG_EVENT and agent_id is not None and step is not None:
+            log_event(
+                step=step,
+                event_type='breed_operation',
+                agent_id=agent_id,
+                details={
+                    'parent1_expression': parent1_str,
+                    'parent2_expression': parent2_str,
+                    'child_expression': new_expr.to_string(),
+                    'donor_subtree': donor_node.to_string(),
+                    'replaced_subtree': original_subtree_str,
+                    'simplified_due_to_depth': simplified
+                }
+            )
+            logger.debug(f"Agent {agent_id}: Bred new expression from parents")
+
+        # Apply mutation after breeding sometimes
+        if random.random() < 0.05:  # Lower mutation rate after breed
+            new_expr.mutate(rate=0.05, agent_id=agent_id, step=step)
+            
         return new_expr
 
     def _copy(self) -> 'ExpressionNode':
